@@ -12,10 +12,10 @@ services:
     env_file:
       - .env
     environment:
-      - AIBUDDY_BASE_URL=https://aibuddy.example.com
-      - AIBUDDY_AUTHENTIK_ISSUER_URL=https://auth.example.com/application/o/ai-buddy/
-      - AIBUDDY_OIDC_CLIENT_ID=ai-buddy
-      - AIBUDDY_OIDC_REDIRECT_URI=https://aibuddy.example.com/auth/callback
+      - AIBUDDY_BASE_URL=https://buddy.osmosis.page
+      - AIBUDDY_AUTHENTIK_ISSUER_URL=https://auth.osmosis.page/application/o/buddy/
+      - AIBUDDY_OIDC_CLIENT_ID=xdaJt41feHdHQwC1RXDBXqEgnZtnkPJuTiJ3EA0M
+      - AIBUDDY_OIDC_REDIRECT_URI=https://buddy.osmosis.page/auth/callback
       # No AIBUDDY_OIDC_CLIENT_SECRET: this Authentik provider is a Public
       # client (PKCE-only, no shared secret).
       - AIBUDDY_SQLITE_PATH=/data/db/ai_buddy.db

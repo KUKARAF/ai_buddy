@@ -71,7 +71,7 @@ jobs:
       - name: Build frontend
         working-directory: web
         env:
-          PUBLIC_API_BASE_URL: https://aibuddy.example.com
+          PUBLIC_API_BASE_URL: https://buddy.osmosis.page
           PUBLIC_APP_MODE: tauri
         run: |
           npm ci
