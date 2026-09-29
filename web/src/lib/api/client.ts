@@ -197,6 +197,34 @@ export interface Notification {
 	sent_at: string | null;
 }
 
+/**
+ * A suggested circle: a cluster of users pursuing goals similar to one of yours.
+ * Derived server-side from goal embeddings; there is no membership/join yet.
+ */
+export interface CircleSuggestion {
+	/** Circle theme, e.g. "Creative", "Learning". */
+	category: string;
+	/** How many people are working toward something similar. */
+	member_count: number;
+	/** Mean similarity score of the cluster, 0..1. */
+	avg_score: number;
+	/** The user's goal this suggestion was matched from. */
+	based_on_goal_id: string;
+	based_on_goal_title: string;
+}
+
+/** GET /api/circles/suggestions payload. */
+export interface CircleSuggestions {
+	circles: CircleSuggestion[];
+}
+
+/** GET /api/goals/:id/similar payload — how many others share a similar goal. */
+export interface SimilarGoals {
+	similar_user_count: number;
+	/** Mean similarity score of the matched users, 0..1. */
+	avg_score: number;
+}
+
 // --- Typed API helpers --------------------------------------------------------
 
 /**
@@ -555,4 +583,29 @@ export function getRoadmap(goalId: string, options?: RequestOptions): Promise<Ro
 /** GET /api/notifications — in-app notifications (reminders, tips, check-ins). */
 export function listNotifications(options?: RequestOptions): Promise<Notification[]> {
 	return request<Notification[]>('GET', '/api/notifications', undefined, options);
+}
+
+// --- Circles ------------------------------------------------------------------
+
+/**
+ * GET /api/circles/suggestions — clusters of users pursuing goals similar to
+ * the caller's. Empty (`{ circles: [] }`) is the normal early case when few
+ * users have embedded goals; callers show an honest empty state, never fakes.
+ */
+export function getCircleSuggestions(options?: RequestOptions): Promise<CircleSuggestions> {
+	return request<CircleSuggestions>('GET', '/api/circles/suggestions', undefined, options);
+}
+
+/**
+ * GET /api/goals/:id/similar — how many other users have a similar goal.
+ * Requires goal embeddings, so `similar_user_count: 0` is the honest normal
+ * case until an OpenRouter key is configured; callers hide the line when 0.
+ */
+export function getSimilar(goalId: string, options?: RequestOptions): Promise<SimilarGoals> {
+	return request<SimilarGoals>(
+		'GET',
+		`/api/goals/${encodeURIComponent(goalId)}/similar`,
+		undefined,
+		options
+	);
 }

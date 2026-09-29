@@ -18,12 +18,14 @@
 		createPledge,
 		confirmPledge,
 		getWallet,
+		getSimilar,
 		ApiError,
 		type Goal,
 		type Roadmap,
 		type RoadmapStep,
 		type CheckIn,
-		type Pledge
+		type Pledge,
+		type SimilarGoals
 	} from '$lib/api/client';
 
 	const goalId = page.params.id ?? '';
@@ -33,6 +35,7 @@
 	let checkIns = $state<CheckIn[]>([]);
 	let pledge = $state<Pledge | null>(null);
 	let walletCents = $state<number | null>(null);
+	let similar = $state<SimilarGoals | null>(null);
 
 	let loading = $state(true);
 	let loadState = $state<'ok' | 'guest' | 'notfound' | 'error'>('ok');
@@ -77,7 +80,13 @@
 		void getWallet()
 			.then((w) => (walletCents = w.balance_cents))
 			.catch(() => (walletCents = null));
+		void getSimilar(goalId)
+			.then((s) => (similar = s))
+			.catch(() => (similar = null));
 	});
+
+	// Real count of other users with a similar goal (0 = honest normal case).
+	const similarCount = $derived(similar?.similar_user_count ?? 0);
 
 	const look = $derived(goal ? goalLook(goal) : null);
 	const steps = $derived<RoadmapStep[]>(roadmap?.steps ?? []);
@@ -388,6 +397,16 @@
 
 			<!-- SIDE: pledge + actions -->
 			<aside class="side">
+				{#if similarCount > 0}
+					<section class="card community">
+						<span class="community-ic"><Icon name="people" size={18} /></span>
+						<p>
+							<strong>{similarCount}</strong> other {similarCount === 1 ? 'person' : 'people'} working
+							on something similar.
+						</p>
+					</section>
+				{/if}
+
 				<section class="card pledge">
 					<p class="eyebrow">A promise to yourself</p>
 					{#if pledge}
@@ -707,6 +726,27 @@
 		font-size: 12px;
 	}
 
+	.community {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 14px 16px;
+	}
+	.community-ic {
+		width: 34px;
+		height: 34px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--sage) 40%, var(--card));
+		color: var(--sage-ink);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: none;
+	}
+	.community p {
+		margin: 0;
+		font-size: 14px;
+	}
 	.pledge {
 		padding: 18px;
 	}

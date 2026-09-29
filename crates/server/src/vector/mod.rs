@@ -38,7 +38,7 @@ fn encode(v: &[f32]) -> Vec<u8> {
 
 /// Decode little-endian `f32` bytes back into a vector. Trailing bytes that
 /// don't form a full `f32` are ignored.
-fn decode(b: &[u8]) -> Vec<f32> {
+pub(crate) fn decode(b: &[u8]) -> Vec<f32> {
     b.as_chunks::<4>()
         .0
         .iter()
@@ -159,6 +159,86 @@ pub async fn search(
                 kind,
                 source_id,
                 text,
+                score,
+            })
+        })
+        .collect();
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(k);
+    Ok(hits)
+}
+
+/// One retrieved memory row belonging to *another* user, scored by cosine
+/// similarity to the query vector. Carries the owning `user_id` and `source_id`
+/// so callers can aggregate matches server-side — these fields must never be
+/// forwarded verbatim to an end user (they identify another person's private
+/// data). See [`crate::circles`] for the privacy-preserving aggregation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossHit {
+    pub user_id: String,
+    pub source_id: String,
+    pub kind: String,
+    pub score: f32,
+}
+
+/// Return the top-`k` embeddings owned by users *other than* `exclude_user_id`,
+/// by cosine similarity to `embedding`, most similar first. Identical brute-force
+/// cosine scan to [`search`], but scoped with `WHERE user_id != ?` (and the
+/// optional `kinds` filter). Rows whose stored dimension differs from the query
+/// length, and zero-magnitude vectors, are skipped.
+pub async fn search_across_users(
+    pool: &SqlitePool,
+    exclude_user_id: &str,
+    embedding: &[f32],
+    k: usize,
+    kinds: &[&str],
+) -> AppResult<Vec<CrossHit>> {
+    if k == 0 || embedding.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from(
+        "SELECT user_id, source_id, kind, vec, dim FROM embeddings WHERE user_id != ?",
+    );
+    if !kinds.is_empty() {
+        sql.push_str(" AND kind IN (");
+        for (i, _) in kinds.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+    }
+
+    let mut q =
+        sqlx::query_as::<_, (String, String, String, Vec<u8>, i64)>(&sql).bind(exclude_user_id);
+    for kind in kinds {
+        q = q.bind(*kind);
+    }
+
+    let rows = q
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let mut hits: Vec<CrossHit> = rows
+        .into_iter()
+        .filter_map(|(user_id, source_id, kind, vec, dim)| {
+            if dim as usize != embedding.len() {
+                return None;
+            }
+            let stored = decode(&vec);
+            let score = cosine(embedding, &stored)?;
+            Some(CrossHit {
+                user_id,
+                source_id,
+                kind,
                 score,
             })
         })

@@ -3,7 +3,8 @@
 // The layout hydrates `me` (GET /auth/me) and `goals` (GET /api/goals) once on
 // mount; every page reads from the same singleton so the sidebar, greeting and
 // dashboard stay in sync. A 401 or network error is never fatal — it just means
-// "guest", and pages fall back to the example workspace content.
+// "guest": not signed in, with no data. Pages then show honest empty states,
+// never fabricated content.
 
 import { getMe, listGoals, getStreak, type Me, type Goal, type Streak } from './api/client';
 
@@ -23,11 +24,6 @@ class AppState {
 		const name = this.me?.display_name?.trim();
 		if (!name) return 'there';
 		return name.split(/\s+/)[0];
-	}
-
-	/** Whether we should show example/dashboard content instead of real goals. */
-	get showExamples(): boolean {
-		return this.isGuest || this.goals.length === 0;
 	}
 
 	async load(): Promise<void> {

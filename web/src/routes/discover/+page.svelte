@@ -73,9 +73,9 @@
 
 	<section class="card circles-strip">
 		<div>
-			<p class="eyebrow">Founding circles</p>
+			<p class="eyebrow">Circles</p>
 			<h3>Take the first steps alongside others.</h3>
-			<p class="muted">Small groups forming around goals like these — join the waitlist.</p>
+			<p class="muted">A way to find people working toward similar goals — coming soon.</p>
 		</div>
 		<a class="btn btn-ghost" href={resolve('/circles')}>
 			<Icon name="people" size={16} /> Explore circles

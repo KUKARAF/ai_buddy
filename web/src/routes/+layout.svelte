@@ -96,7 +96,9 @@
 				<span class="avatar">{initial}</span>
 				<span class="who">
 					<strong>{app.me.display_name ?? app.me.email ?? 'You'}</strong>
-					<span class="muted small">Founding member</span>
+					{#if app.me.display_name && app.me.email}
+						<span class="muted small">{app.me.email}</span>
+					{/if}
 				</span>
 				<Icon name="gear" size={18} />
 			{:else}

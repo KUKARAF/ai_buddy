@@ -41,50 +41,21 @@
 	const today = new Date();
 	const eyebrow = dateEyebrow(today);
 
-	// Hero: from the first pending step of the first goal's roadmap, else example.
+	// Hero: derived only from the user's real first goal and its roadmap's first
+	// pending step. With no goal, the template shows an honest welcome hero.
 	const heroGoal = $derived(app.goals[0] ?? null);
 	const heroStep = $derived(heroGoal ? (roadmaps[heroGoal.id]?.firstPending ?? null) : null);
-	const heroTitle = $derived(heroStep?.title ?? 'Build a comfortable warm-up');
-	const heroDesc = $derived(
-		heroStep?.detail ??
-			(heroGoal
-				? `A small step toward "${heroGoal.title}".`
-				: 'Ten quiet minutes. Loosen up, hum the melody, and let it feel easy before it feels good.')
-	);
 
-	// Example goal cards for guests / empty state.
-	const exampleGoals = [
-		{
-			title: 'Sing our song at my wedding',
-			category: 'Creative',
-			tile: 'peach' as const,
-			icon: 'music',
-			deadline: '12 Dec',
-			done: 1,
-			total: 4
-		},
-		{
-			title: 'Have a real conversation in Spanish',
-			category: 'Learning',
-			tile: 'lavender' as const,
-			icon: 'book',
-			deadline: '30 Nov',
-			done: 2,
-			total: 4
-		}
-	];
-
-	const showBanner = $derived(app.showExamples);
-
-	// Streak (real when signed in; otherwise an example week).
+	// Streak comes only from GET /api/streak; when unavailable (guest/error) the
+	// view falls back to an honest zero state with an empty current week.
 	const streak = $derived(app.streak);
 	const streakLabel = $derived.by(() => {
 		const n = streak?.current_streak ?? 0;
 		return n > 0 ? `${n} day streak` : 'Your streak starts today';
 	});
-	const checkInCount = $derived(streak ? streak.week.filter((d) => d.checked).length : 2);
+	const checkInCount = $derived(streak ? streak.week.filter((d) => d.checked).length : 0);
 
-	// A 7-cell view model: real streak days, or an example (first two checked).
+	// A 7-cell view model: real streak days, or an honest empty current week.
 	interface DayCell {
 		label: string;
 		checked: boolean;
@@ -104,11 +75,15 @@
 				};
 			});
 		}
+		// No streak data yet: real current week (Mon–Sun), today marked, none checked.
+		const dayMs = 24 * 60 * 60 * 1000;
+		const dowToday = (today.getDay() + 6) % 7; // Mon=0
+		const mondayMs = today.getTime() - dowToday * dayMs;
 		return WEEK_LABELS.map((label, i) => ({
 			label,
-			checked: i < 2,
-			today: i === 2,
-			num: i + 24
+			checked: false,
+			today: i === dowToday,
+			num: new Date(mondayMs + i * dayMs).getDate()
 		}));
 	});
 
@@ -119,15 +94,6 @@
 
 <div class="today">
 	<div class="col-main">
-		{#if showBanner}
-			<div class="banner">
-				<span>You're exploring an example workspace. Make it yours with your first goal.</span>
-				<button class="banner-cta" onclick={() => wizard.openWizard()}>
-					Start my goal <Icon name="plus" size={13} />
-				</button>
-			</div>
-		{/if}
-
 		<div class="greet">
 			<div>
 				<p class="eyebrow">{eyebrow}</p>
@@ -144,51 +110,57 @@
 		<section class="hero">
 			<Icon name="arrow-ur" size={190} stroke={1} />
 			<div class="hero-body">
-				<div class="hero-top">
-					<span class="hero-eyebrow"><span class="reddot"></span> Your next small step</span>
-					<span class="timepill">
-						<Icon name="clock" size={13} />
-						{heroGoal?.time_per_session_min ?? 20} min
-					</span>
-				</div>
-				<h2 class="hero-title">{heroTitle}</h2>
-				<p class="hero-desc">{heroDesc}</p>
-				<div class="hero-actions">
-					{#if heroGoal}
+				{#if heroGoal}
+					<div class="hero-top">
+						<span class="hero-eyebrow"><span class="reddot"></span> Your next small step</span>
+						<span class="timepill">
+							<Icon name="clock" size={13} />
+							{heroGoal.time_per_session_min ?? 20} min
+						</span>
+					</div>
+					<h2 class="hero-title">{heroStep?.title ?? heroGoal.title}</h2>
+					<p class="hero-desc">
+						{heroStep?.detail ??
+							`A small step toward "${heroGoal.title}". Open your plan to choose it.`}
+					</p>
+					<div class="hero-actions">
 						<a class="btn btn-lime" href={resolve('/goals/[id]', { id: heroGoal.id })}
 							><Icon name="check" size={16} stroke={2.4} /> Let's do this</a
 						>
 						<a class="see" href={resolve('/goals/[id]', { id: heroGoal.id })}
 							>See the whole plan <Icon name="chevron-r" size={15} /></a
 						>
-					{:else}
+					</div>
+				{:else}
+					<div class="hero-top">
+						<span class="hero-eyebrow"><span class="reddot"></span> Your first goal</span>
+					</div>
+					<h2 class="hero-title">What's your someday?</h2>
+					<p class="hero-desc">
+						You don't have a goal yet. Start one small conversation and we'll help you shape it into
+						a doable plan.
+					</p>
+					<div class="hero-actions">
 						<button class="btn btn-lime" onclick={() => wizard.openWizard()}
-							><Icon name="check" size={16} stroke={2.4} /> Let's do this</button
+							><Icon name="plus" size={16} stroke={2.4} /> Start my first goal</button
 						>
-						<a class="see" href={resolve('/goals')}
-							>See the whole plan <Icon name="chevron-r" size={15} /></a
-						>
-					{/if}
-				</div>
+					</div>
+				{/if}
 			</div>
 		</section>
 
 		<!-- YOUR GOALS -->
 		<section class="goals-section">
 			<div class="sec-head">
-				<h2>
-					Your goals <span class="muted"
-						>{app.showExamples ? exampleGoals.length : app.goals.length}</span
+				<h2>Your goals <span class="muted">{app.goals.length}</span></h2>
+				{#if app.goals.length > 0}
+					<a class="viewall" href={resolve('/goals')}
+						>View all <Icon name="chevron-r" size={14} /></a
 					>
-				</h2>
-				<a class="viewall" href={resolve('/goals')}>View all <Icon name="chevron-r" size={14} /></a>
+				{/if}
 			</div>
-			<div class="goal-row">
-				{#if app.showExamples}
-					{#each exampleGoals as g (g.title)}
-						<GoalCard {...g} />
-					{/each}
-				{:else}
+			{#if app.goals.length > 0}
+				<div class="goal-row">
 					{#each app.goals as goal (goal.id)}
 						{@const look = goalLook(goal)}
 						{@const p = roadmaps[goal.id]}
@@ -203,8 +175,16 @@
 							href={goalHref(goal.id)}
 						/>
 					{/each}
-				{/if}
-			</div>
+				</div>
+			{:else}
+				<div class="card goals-empty">
+					<span class="tile tile-sage"><Icon name="target" size={24} /></span>
+					<p>No goals yet. Your first small step is one conversation away.</p>
+					<button class="btn btn-lime" onclick={() => wizard.openWizard()}>
+						<Icon name="plus" size={16} /> Start my first goal
+					</button>
+				</div>
+			{/if}
 		</section>
 
 		<!-- GENTLE REMINDER -->
@@ -215,7 +195,6 @@
 					Consistency isn't doing it perfectly. It's coming back, even after a messy day.
 				</p>
 			</div>
-			<span class="counter muted">01 / 07</span>
 		</section>
 	</div>
 
@@ -227,7 +206,7 @@
 				<h3>Your week, in small wins</h3>
 			</div>
 			<p class="muted small">
-				{streak ? 'Every check-in is a small win.' : 'An example of a week with momentum.'}
+				{streak ? 'Every check-in is a small win.' : 'Your streak starts today.'}
 			</p>
 			<div class="week">
 				{#each weekCells as cell, i (i)}
@@ -278,31 +257,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 22px;
-	}
-
-	.banner {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		font-size: 13px;
-		color: var(--muted);
-		background: var(--tag-bg);
-		border: 1px solid var(--line);
-		border-radius: 12px;
-		padding: 10px 14px;
-	}
-	.banner-cta {
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-		font-weight: 600;
-		color: var(--ink);
-		white-space: nowrap;
-		background: transparent;
-		border: none;
-		font-size: 13px;
-		padding: 0;
 	}
 
 	.greet {
@@ -439,6 +393,20 @@
 		gap: 16px;
 		margin-top: 14px;
 	}
+	.goals-empty {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		text-align: center;
+		gap: 12px;
+		padding: 34px 24px;
+		margin-top: 14px;
+	}
+	.goals-empty p {
+		margin: 0;
+		max-width: 40ch;
+		color: var(--muted);
+	}
 
 	/* reminder */
 	.reminder {
@@ -458,11 +426,6 @@
 		font-size: 15px;
 		font-weight: 500;
 		max-width: 60ch;
-	}
-	.counter {
-		font-size: 13px;
-		font-weight: 600;
-		white-space: nowrap;
 	}
 
 	/* right rail */
