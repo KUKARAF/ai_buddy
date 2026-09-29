@@ -1,0 +1,183 @@
+/* buddy. — global design tokens + base styles.
+   Fully self-contained: system font stack, no external fonts/CDNs/images. */
+
+:root {
+	--bg: #f9faf8;
+	--ink: #20353c;
+	--muted: #8a927f;
+	--teal: #203940;
+	--lime: #d9fa75;
+	--card: #ffffff;
+	--line: #e9ece5;
+	--tag-bg: #f6f7f2;
+	--tag-ink: #8a927f;
+
+	/* pastel icon tiles */
+	--peach: #f6ddc9;
+	--lavender: #e7e2f7;
+	--sage: #ddeccb;
+	--sky: #d9e8f0;
+
+	/* darker glyph tones for tiles */
+	--peach-ink: #b9773f;
+	--lavender-ink: #6a5aa8;
+	--sage-ink: #5f8a3e;
+	--sky-ink: #3f7793;
+
+	--track: #eef1ea;
+
+	--radius-card: 18px;
+	--radius-btn: 10px;
+	--radius-tile: 12px;
+
+	--shadow: 0 1px 2px rgba(20, 40, 45, 0.04), 0 1px 3px rgba(20, 40, 45, 0.06);
+
+	--font: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	max-width: 100%;
+	overflow-x: hidden;
+}
+
+body {
+	font-family: var(--font);
+	color: var(--ink);
+	background: var(--bg);
+	-webkit-font-smoothing: antialiased;
+	line-height: 1.45;
+}
+
+a {
+	color: inherit;
+	text-decoration: none;
+}
+
+button {
+	font-family: inherit;
+	cursor: pointer;
+}
+
+button:disabled {
+	opacity: 0.55;
+	cursor: default;
+}
+
+h1,
+h2,
+h3 {
+	margin: 0;
+	font-weight: 600;
+	letter-spacing: -0.01em;
+}
+
+/* ---- shared utility classes ------------------------------------------ */
+
+.card {
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: var(--radius-card);
+	box-shadow: var(--shadow);
+}
+
+.eyebrow {
+	text-transform: uppercase;
+	letter-spacing: 0.12em;
+	font-size: 11px;
+	font-weight: 600;
+	color: var(--muted);
+}
+
+.dot-lime {
+	color: var(--lime);
+}
+
+.muted {
+	color: var(--muted);
+}
+
+/* primary dark button */
+.btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	border: none;
+	border-radius: var(--radius-btn);
+	padding: 10px 16px;
+	font-size: 14px;
+	font-weight: 600;
+	background: var(--teal);
+	color: #fff;
+}
+
+.btn-lime {
+	background: var(--lime);
+	color: var(--ink);
+}
+
+.btn-ghost {
+	background: transparent;
+	color: var(--ink);
+	border: 1px solid var(--line);
+}
+
+/* category pill */
+.pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	background: var(--tag-bg);
+	color: var(--tag-ink);
+	border-radius: 999px;
+	padding: 4px 10px;
+	font-size: 12px;
+	font-weight: 600;
+}
+
+/* pastel icon tile */
+.tile {
+	width: 44px;
+	height: 44px;
+	border-radius: var(--radius-tile);
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: none;
+}
+.tile-peach {
+	background: var(--peach);
+	color: var(--peach-ink);
+}
+.tile-lavender {
+	background: var(--lavender);
+	color: var(--lavender-ink);
+}
+.tile-sage {
+	background: var(--sage);
+	color: var(--sage-ink);
+}
+.tile-sky {
+	background: var(--sky);
+	color: var(--sky-ink);
+}
+
+/* progress bar */
+.progress {
+	height: 7px;
+	border-radius: 999px;
+	background: var(--track);
+	overflow: hidden;
+}
+.progress > span {
+	display: block;
+	height: 100%;
+	border-radius: 999px;
+	background: var(--lime);
+}
