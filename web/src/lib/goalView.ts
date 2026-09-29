@@ -13,7 +13,7 @@ export interface Look {
 	category: string;
 }
 
-/** The category options offered in the wizard / used across the app. */
+/** The category options used across the app. */
 export const CATEGORIES = [
 	'Creative',
 	'Learning',

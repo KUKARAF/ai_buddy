@@ -14,9 +14,21 @@ class AppState {
 	streak = $state<Streak | null>(null);
 	/** True once the initial auth + goals fetch has settled (success or not). */
 	loaded = $state(false);
+	/** Dedupes concurrent load() calls so auth is fetched exactly once. */
+	private loadPromise: Promise<void> | null = null;
 
 	get isGuest(): boolean {
 		return this.me === null;
+	}
+
+	/**
+	 * Resolve the initial auth + data load exactly once, sharing a single
+	 * in-flight promise across all callers. Guards call this before reading
+	 * `isGuest` so a not-yet-loaded state never misreports a signed-in user.
+	 */
+	ensureLoaded(): Promise<void> {
+		if (this.loadPromise === null) this.loadPromise = this.load();
+		return this.loadPromise;
 	}
 
 	/** First name for greetings, from display_name; falls back to "there". */

@@ -21,7 +21,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use ai_buddy_core::domain::{GoalStatus, ReminderKind, StepStatus};
+use ai_buddy_core::domain::{GoalStatus, PledgeStatus, ReminderKind, StepStatus};
 
 use crate::auth::session::RequireAuth;
 use crate::error::{AppError, AppResult};
@@ -131,6 +131,42 @@ struct StepDraft {
     detail: Option<String>,
     #[serde(default)]
     due_date: Option<String>,
+}
+
+/// A complete goal + milestone plan, as produced by the agentic coach's
+/// `save_goal` tool call. Deserialized straight from the model's tool arguments
+/// (then sanitized by the caller before it reaches [`create_goal_with_milestones`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewGoalWithPlan {
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub deadline: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub skill_level: Option<String>,
+    #[serde(default)]
+    pub time_per_session_min: Option<i64>,
+    #[serde(default)]
+    pub success_criterion: Option<String>,
+    #[serde(default)]
+    pub milestones: Vec<NewMilestone>,
+    #[serde(default)]
+    pub pledge_cents: Option<i64>,
+}
+
+/// One milestone within a [`NewGoalWithPlan`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewMilestone {
+    pub title: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub due_date: Option<String>,
 }
 
 // --- Router -------------------------------------------------------------------
@@ -587,6 +623,97 @@ async fn persist_roadmap(
     }
 
     Ok(roadmap_id)
+}
+
+/// Create a goal plus its milestone roadmap from an agent-supplied plan (no LLM
+/// call — the milestones come from the caller's tool arguments). Inserts the goal
+/// as `active`, persists a roadmap (`model = "agent"`) when milestones are
+/// present (which also seeds reminders for dated steps and embeds each step),
+/// best-effort embeds the goal for RAG, and — when `pledge_cents > 0` — records a
+/// `proposed` pledge (no funds are held; the user confirms holds separately).
+/// Returns the new goal id.
+pub async fn create_goal_with_milestones(
+    state: &AppState,
+    user_id: &str,
+    draft: NewGoalWithPlan,
+) -> AppResult<String> {
+    // Insert the goal (starts as `draft`), then activate it now that it has a plan.
+    let goal = insert_goal(
+        &state.db,
+        user_id,
+        &draft.title,
+        draft.description.as_deref(),
+        draft.category.as_deref(),
+        draft.deadline.as_deref(),
+        draft.location.as_deref(),
+        draft.skill_level.as_deref(),
+        draft.success_criterion.as_deref(),
+        draft.time_per_session_min,
+    )
+    .await?;
+
+    let now = now_rfc3339()?;
+    sqlx::query("UPDATE goals SET status = ?, updated_at = ? WHERE id = ?")
+        .bind(GoalStatus::Active.as_str())
+        .bind(&now)
+        .bind(&goal.id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    // Persist the milestone roadmap (reuses the LLM roadmap path's writer).
+    if !draft.milestones.is_empty() {
+        let roadmap = RoadmapDraft {
+            steps: draft
+                .milestones
+                .iter()
+                .map(|m| StepDraft {
+                    title: m.title.clone(),
+                    detail: m.detail.clone(),
+                    due_date: m.due_date.clone(),
+                })
+                .collect(),
+        };
+        persist_roadmap(state, user_id, &goal.id, "agent", &roadmap).await?;
+    }
+
+    // Best-effort RAG memory of the goal.
+    let goal_text = match goal.description.as_deref() {
+        Some(desc) if !desc.trim().is_empty() => format!("{}: {}", goal.title, desc),
+        _ => goal.title.clone(),
+    };
+    embed_upsert(state, user_id, "goal", &goal.id, &goal_text).await;
+
+    // Optional symbolic pledge: record it as `proposed` only (funds are held only
+    // when the user confirms via the wallet's confirm path). Best-effort.
+    if let Some(cents) = draft.pledge_cents {
+        if cents > 0 {
+            let pledge_id = Uuid::new_v4().to_string();
+            if let Err(e) = sqlx::query(
+                "INSERT INTO pledges \
+                     (id, goal_id, user_id, amount_cents, status, created_at, resolved_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, NULL) \
+                 ON CONFLICT(goal_id) DO UPDATE SET \
+                     amount_cents = excluded.amount_cents, \
+                     user_id = excluded.user_id, \
+                     status = excluded.status, \
+                     resolved_at = NULL",
+            )
+            .bind(&pledge_id)
+            .bind(&goal.id)
+            .bind(user_id)
+            .bind(cents)
+            .bind(PledgeStatus::Proposed.as_str())
+            .bind(&now)
+            .execute(&state.db)
+            .await
+            {
+                tracing::warn!(error = ?e, goal_id = %goal.id, "proposed pledge insert failed (ignored)");
+            }
+        }
+    }
+
+    Ok(goal.id)
 }
 
 // --- Handlers -----------------------------------------------------------------

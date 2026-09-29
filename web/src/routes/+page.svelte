@@ -1,12 +1,24 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
 	import GoalCard from '$lib/components/GoalCard.svelte';
 	import { app } from '$lib/appState.svelte';
-	import { getRoadmap, type Roadmap, type RoadmapStep } from '$lib/api/client';
+	import { getRoadmap, loginUrl, type Roadmap, type RoadmapStep } from '$lib/api/client';
 	import { dateEyebrow, shortDate } from '$lib/format';
 	import { goalLook } from '$lib/goalView';
-	import { wizard } from '$lib/wizardState.svelte';
+	import { coach } from '$lib/coachState.svelte';
+
+	// Open the coach on a brand-new conversation; guests go to login first.
+	async function startCoach(): Promise<void> {
+		await app.ensureLoaded();
+		if (app.isGuest) {
+			window.location.href = loginUrl();
+			return;
+		}
+		coach.startNew();
+		await goto(resolve('/chat'));
+	}
 
 	const WEEK_LABELS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 
@@ -141,7 +153,7 @@
 						a doable plan.
 					</p>
 					<div class="hero-actions">
-						<button class="btn btn-lime" onclick={() => wizard.openWizard()}
+						<button class="btn btn-lime" onclick={startCoach}
 							><Icon name="plus" size={16} stroke={2.4} /> Start my first goal</button
 						>
 					</div>
@@ -180,7 +192,7 @@
 				<div class="card goals-empty">
 					<span class="tile tile-sage"><Icon name="target" size={24} /></span>
 					<p>No goals yet. Your first small step is one conversation away.</p>
-					<button class="btn btn-lime" onclick={() => wizard.openWizard()}>
+					<button class="btn btn-lime" onclick={startCoach}>
 						<Icon name="plus" size={16} /> Start my first goal
 					</button>
 				</div>

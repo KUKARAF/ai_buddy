@@ -288,6 +288,25 @@ export function createConversation(
 	);
 }
 
+/** GET /api/conversations/:id payload — a conversation plus its messages. */
+export interface ConversationDetail {
+	conversation: Conversation;
+	messages: Message[];
+}
+
+/** GET /api/conversations/:id — fetch a conversation with its full message history. */
+export function getConversation(
+	conversationId: string,
+	options?: RequestOptions
+): Promise<ConversationDetail> {
+	return request<ConversationDetail>(
+		'GET',
+		`/api/conversations/${encodeURIComponent(conversationId)}`,
+		undefined,
+		options
+	);
+}
+
 /**
  * POST /api/conversations/:id/messages — send a user message and get the
  * assistant reply.
@@ -311,125 +330,36 @@ export function sendMessage(
 	);
 }
 
-/** Callbacks for {@link streamMessage}. */
-export interface StreamHandlers {
-	/** A token delta arrived; append it to the in-progress assistant message. */
-	onToken: (token: string) => void;
-	/** The stream finished; `costCents` is what the wallet was debited. */
-	onDone?: (costCents: number) => void;
-	/** The backend emitted an inline `error` SSE event mid-stream. */
-	onError?: (message: string) => void;
+/** The reply from the agentic coach turn (POST /api/conversations/:id/agent). */
+export interface AgentReply {
+	/** The coach's assistant message for this turn. */
+	reply: string;
+	/** Set to the new goal's id when the coach created a goal during the turn. */
+	created_goal_id: string | null;
 }
 
 /**
- * POST /api/conversations/:id/messages, consuming the Server-Sent Events stream.
+ * POST /api/conversations/:id/agent — run one agentic coach turn.
  *
- * The backend emits, per the coach contract:
- *   - default (unnamed) events whose `data` is a raw token delta,
- *   - a final `event: done` whose data is `{"cost_cents": <int>}`,
- *   - an optional `event: error` with a plain-text message.
+ * The backend runs the coach agent: it may ask follow-ups, propose a plan, and
+ * (via a server-side tool) create the goal once the user has confirmed in chat.
+ * This is a plain, NON-streaming request — the turn can take a few seconds. The
+ * user + assistant messages are persisted server-side.
  *
- * A pre-stream failure (e.g. 402 when the wallet is empty) is surfaced by
- * throwing an {@link ApiError} before any tokens are delivered, so callers can
- * inspect `.status === 402`.
+ * Can throw {@link ApiError} with `.status === 402` (wallet empty) or
+ * `.status === 400` (no LLM key configured); callers surface those gently.
  */
-export async function streamMessage(
+export function sendAgentMessage(
 	conversationId: string,
 	content: string,
-	handlers: StreamHandlers,
-	options: RequestOptions = {}
-): Promise<void> {
-	const url = `${API_BASE_URL}/api/conversations/${encodeURIComponent(conversationId)}/messages`;
-	const deviceToken = getDeviceToken();
-
-	let response: Response;
-	try {
-		response = await fetch(url, {
-			method: 'POST',
-			credentials: 'include',
-			headers: {
-				'Content-Type': 'application/json',
-				Accept: 'text/event-stream',
-				...(deviceToken !== null ? { Authorization: `Bearer ${deviceToken}` } : {}),
-				...options.headers
-			},
-			body: JSON.stringify({ content }),
-			signal: options.signal
-		});
-	} catch (cause) {
-		throw new ApiError(
-			`Network error while requesting POST ${url}`,
-			0,
-			cause instanceof Error ? cause.message : cause
-		);
-	}
-
-	if (!response.ok) {
-		const contentType = response.headers.get('content-type') ?? '';
-		const isJson = contentType.includes('application/json');
-		const payload = isJson ? await response.json().catch(() => undefined) : undefined;
-		const message =
-			(isJson && payload && typeof payload === 'object' && 'message' in payload
-				? String((payload as Record<string, unknown>).message)
-				: undefined) ?? `Request failed with status ${response.status}`;
-		throw new ApiError(message, response.status, payload);
-	}
-
-	if (response.body === null) {
-		// No stream body (shouldn't happen for SSE) — nothing to read.
-		handlers.onDone?.(0);
-		return;
-	}
-
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = '';
-
-	// Parse one SSE frame (already split on the blank-line separator).
-	const handleFrame = (frame: string): void => {
-		let event = 'message';
-		const dataLines: string[] = [];
-		for (const rawLine of frame.split('\n')) {
-			const line = rawLine.replace(/\r$/, '');
-			if (line === '' || line.startsWith(':')) continue;
-			const colon = line.indexOf(':');
-			const field = colon === -1 ? line : line.slice(0, colon);
-			// Strip the field name and exactly one optional leading space (SSE spec).
-			let value = colon === -1 ? '' : line.slice(colon + 1);
-			if (value.startsWith(' ')) value = value.slice(1);
-			if (field === 'event') event = value;
-			else if (field === 'data') dataLines.push(value);
-		}
-		const data = dataLines.join('\n');
-		if (event === 'done') {
-			let cost = 0;
-			try {
-				const parsed = JSON.parse(data) as { cost_cents?: number };
-				cost = typeof parsed.cost_cents === 'number' ? parsed.cost_cents : 0;
-			} catch {
-				// ignore malformed done payloads; treat as zero-cost.
-			}
-			handlers.onDone?.(cost);
-		} else if (event === 'error') {
-			handlers.onError?.(data);
-		} else if (dataLines.length > 0) {
-			handlers.onToken(data);
-		}
-	};
-
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		buffer += decoder.decode(value, { stream: true });
-		let sep: number;
-		// Frames are separated by a blank line.
-		while ((sep = buffer.indexOf('\n\n')) !== -1) {
-			const frame = buffer.slice(0, sep);
-			buffer = buffer.slice(sep + 2);
-			if (frame.trim() !== '') handleFrame(frame);
-		}
-	}
-	if (buffer.trim() !== '') handleFrame(buffer);
+	options?: RequestOptions
+): Promise<AgentReply> {
+	return request<AgentReply>(
+		'POST',
+		`/api/conversations/${encodeURIComponent(conversationId)}/agent`,
+		{ content },
+		options
+	);
 }
 
 /** GET /api/goals — list the user's goals. */

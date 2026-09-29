@@ -55,6 +55,27 @@ pub struct ChatOutcome {
     pub cost_cents: i64,
 }
 
+/// A single tool/function call requested by the model in a [`ToolTurn`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    /// Provider-assigned id, echoed back in the matching `role:"tool"` message.
+    pub id: String,
+    /// The function name (e.g. `save_goal`).
+    pub name: String,
+    /// The raw JSON argument string exactly as the model produced it.
+    pub arguments: String,
+}
+
+/// The result of one non-streaming tool-calling turn. Either `content` carries
+/// the assistant's prose reply, or `tool_calls` carries one or more requested
+/// function invocations (a turn can, in principle, carry both).
+#[derive(Debug, Clone)]
+pub struct ToolTurn {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub cost_cents: i64,
+}
+
 /// An item in a streaming chat response.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatDelta {
@@ -266,6 +287,62 @@ impl LlmClient {
         Ok((value, cost_cents(model, pt, ct)))
     }
 
+    /// Non-streaming, tool-calling chat completion. `messages` is the raw
+    /// OpenAI-style messages array (each an object with `role`/`content`, and
+    /// possibly an assistant `tool_calls` array or a `role:"tool"` result), and
+    /// `tools` is the OpenAI `tools` array. Sends `tool_choice:"auto"` and parses
+    /// the first choice into a [`ToolTurn`] (assistant prose and/or requested
+    /// function calls) plus a cost estimate. Missing fields degrade to empty.
+    pub async fn chat_tools(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: &serde_json::Value,
+    ) -> AppResult<ToolTurn> {
+        let key = self.require_chat_key()?;
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+        });
+
+        let resp = self
+            .inner
+            .http
+            .post(&self.inner.chat_url)
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(anyhow!("LLM request failed: {e}")))?;
+
+        let parsed: ToolChatResponse = read_json(resp).await?;
+        let (content, tool_calls) = match parsed.choices.into_iter().next() {
+            Some(choice) => {
+                let calls = choice
+                    .message
+                    .tool_calls
+                    .into_iter()
+                    .map(|t| ToolCall {
+                        id: t.id,
+                        name: t.function.name,
+                        arguments: t.function.arguments,
+                    })
+                    .collect();
+                (choice.message.content, calls)
+            }
+            None => (None, Vec::new()),
+        };
+
+        let (pt, ct) = parsed.usage.unwrap_or_default().tokens();
+        Ok(ToolTurn {
+            content,
+            tool_calls,
+            cost_cents: cost_cents(model, pt, ct),
+        })
+    }
+
     /// Streaming chat completion. Yields a [`ChatDelta::Token`] per delta, then a
     /// final [`ChatDelta::Done`] carrying the cost (from the usage event emitted
     /// because we send `stream_options.include_usage`). Robust to SSE lines that
@@ -463,6 +540,45 @@ struct ChatChoice {
 #[derive(Debug, serde::Deserialize)]
 struct ChatChoiceMessage {
     content: Option<String>,
+}
+
+// Tool-calling response shapes (parsed by `chat_tools`). Kept separate from
+// `ChatResponse` so the plain chat/JSON paths are unaffected.
+
+#[derive(Debug, serde::Deserialize)]
+struct ToolChatResponse {
+    #[serde(default)]
+    choices: Vec<ToolChatChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ToolChatChoice {
+    message: ToolChatMessage,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ToolChatMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<RespToolCall>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RespToolCall {
+    #[serde(default)]
+    id: String,
+    function: RespFunction,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RespFunction {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    arguments: String,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

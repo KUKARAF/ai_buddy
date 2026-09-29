@@ -1,12 +1,12 @@
 <script lang="ts">
 	import '../app.css';
 	import { onMount } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
-	import GoalWizard from '$lib/components/GoalWizard.svelte';
 	import { app } from '$lib/appState.svelte';
-	import { wizard } from '$lib/wizardState.svelte';
+	import { coach } from '$lib/coachState.svelte';
 	import { loginUrl } from '$lib/api/client';
 
 	let { children } = $props();
@@ -14,7 +14,7 @@
 	let menuOpen = $state(false);
 
 	onMount(() => {
-		void app.load();
+		void app.ensureLoaded();
 	});
 
 	const nav = [
@@ -44,6 +44,18 @@
 		if (path.startsWith(settingsPath)) return 'Settings';
 		return 'Today';
 	});
+
+	// Open the coach on a brand-new conversation, from any "New goal" surface.
+	// Guests are sent to login first — the coach flow requires auth (would 401).
+	async function startCoach(): Promise<void> {
+		await app.ensureLoaded();
+		if (app.isGuest) {
+			window.location.href = loginUrl();
+			return;
+		}
+		coach.startNew();
+		await goto(resolve('/chat'));
+	}
 
 	const goalCount = $derived(app.goals.length);
 	const initial = $derived(
@@ -132,7 +144,7 @@
 			</div>
 			<div class="topbar-right">
 				<span class="private muted"><Icon name="lock" size={15} /> Your private space</span>
-				<button class="btn newgoal" onclick={() => wizard.openWizard()}>
+				<button class="btn newgoal" onclick={startCoach}>
 					<Icon name="plus" size={16} /> New goal
 				</button>
 			</div>
@@ -143,8 +155,6 @@
 		</div>
 	</div>
 </div>
-
-<GoalWizard />
 
 <style>
 	.shell {

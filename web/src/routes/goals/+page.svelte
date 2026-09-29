@@ -1,12 +1,24 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
 	import GoalCard from '$lib/components/GoalCard.svelte';
 	import { app } from '$lib/appState.svelte';
-	import { getRoadmap, type Roadmap } from '$lib/api/client';
+	import { getRoadmap, loginUrl, type Roadmap } from '$lib/api/client';
 	import { shortDate } from '$lib/format';
 	import { goalLook } from '$lib/goalView';
-	import { wizard } from '$lib/wizardState.svelte';
+	import { coach } from '$lib/coachState.svelte';
+
+	// Open the coach on a brand-new conversation; guests go to login first.
+	async function startCoach(): Promise<void> {
+		await app.ensureLoaded();
+		if (app.isGuest) {
+			window.location.href = loginUrl();
+			return;
+		}
+		coach.startNew();
+		await goto(resolve('/chat'));
+	}
 
 	let progress = $state<Record<string, { done: number; total: number }>>({});
 	// Non-reactive guard so each goal's roadmap is fetched at most once.
@@ -61,9 +73,7 @@
 <div class="page">
 	<div class="head">
 		<h1>My goals</h1>
-		<button class="btn" onclick={() => wizard.openWizard()}
-			><Icon name="plus" size={16} /> New goal</button
-		>
+		<button class="btn" onclick={startCoach}><Icon name="plus" size={16} /> New goal</button>
 	</div>
 
 	{#if app.isGuest}
@@ -71,7 +81,7 @@
 			<span class="tile tile-sky"><Icon name="lock" size={24} /></span>
 			<h2>Sign in to see your goals</h2>
 			<p class="muted">Your goals are private to you. Sign in, or start shaping one now.</p>
-			<button class="btn btn-lime" onclick={() => wizard.openWizard()}>
+			<button class="btn btn-lime" onclick={startCoach}>
 				<Icon name="plus" size={16} /> New goal
 			</button>
 		</div>
@@ -80,7 +90,7 @@
 			<span class="tile tile-sage"><Icon name="target" size={24} /></span>
 			<h2>No goals yet</h2>
 			<p class="muted">Start your first one with the coach — it only takes a small conversation.</p>
-			<button class="btn btn-lime" onclick={() => wizard.openWizard()}>
+			<button class="btn btn-lime" onclick={startCoach}>
 				<Icon name="plus" size={16} /> New goal
 			</button>
 		</div>
@@ -101,7 +111,7 @@
 		</div>
 
 		<div class="grid">
-			<button class="card add-tile" onclick={() => wizard.openWizard()}>
+			<button class="card add-tile" onclick={startCoach}>
 				<span class="add-plus"><Icon name="plus" size={22} /></span>
 				<strong>What's your next someday?</strong>
 				<span class="muted small">Start a new goal</span>

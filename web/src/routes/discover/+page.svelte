@@ -1,7 +1,10 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
-	import { wizard } from '$lib/wizardState.svelte';
+	import { app } from '$lib/appState.svelte';
+	import { loginUrl } from '$lib/api/client';
+	import { coach } from '$lib/coachState.svelte';
 	import { categoryLook } from '$lib/goalView';
 
 	interface Idea {
@@ -40,11 +43,25 @@
 			title: 'Ship a tiny side project',
 			category: 'Career',
 			tagline: 'One small thing, finished and out in the world.'
+		},
+		{
+			title: 'Learn to knit socks',
+			category: 'Creative',
+			tagline: 'A cozy new skill, one stitch at a time.'
 		}
 	];
 
-	function makeGoal(idea: Idea): void {
-		wizard.openWizard({ title: idea.title, category: idea.category });
+	// Seed the coach with the idea and open the chat; it auto-sends this once.
+	// Guests are sent to login first (the coach requires auth); the seed is
+	// dropped for guests rather than preserved across the OIDC round-trip.
+	async function makeGoal(idea: Idea): Promise<void> {
+		await app.ensureLoaded();
+		if (app.isGuest) {
+			window.location.href = loginUrl();
+			return;
+		}
+		coach.seedNew(`I want to: ${idea.title}`);
+		await goto(resolve('/chat'));
 	}
 </script>
 
