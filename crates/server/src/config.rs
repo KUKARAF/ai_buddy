@@ -27,11 +27,24 @@ pub struct Config {
     pub static_dir: Option<String>,
 
     // --- LLM / RAG ---
-    /// Deployment-wide OpenRouter API key. `None` when unset/empty.
+    /// Which provider serves CHAT/roadmap completions: `"litellm"` (default) or
+    /// `"openrouter"`. This is the revert switch for CHAT ONLY — embeddings are
+    /// always served by OpenRouter regardless of this value.
+    pub llm_provider: String,
+    /// Deployment-wide OpenRouter API key. `None` when unset/empty. Used for
+    /// embeddings always, and for chat when `llm_provider == "openrouter"`.
     pub openrouter_api_key: Option<String>,
-    /// OpenRouter chat model id used for the coach + roadmap generation.
+    /// LiteLLM proxy API key. `None` when unset/empty. Used for chat when
+    /// `llm_provider == "litellm"`.
+    pub litellm_api_key: Option<String>,
+    /// LiteLLM OpenAI-compatible base URL (no trailing `/chat/completions`).
+    pub litellm_base_url: String,
+    /// Default chat model id used for the coach + roadmap generation when the
+    /// user has not chosen one (or chose one no longer allowed).
     pub chat_model: String,
-    /// Embedding model id used for RAG memory.
+    /// Chat model ids a user is allowed to select from.
+    pub allowed_chat_models: Vec<String>,
+    /// Embedding model id used for RAG memory (always via OpenRouter).
     pub embedding_model: String,
     /// Embedding vector dimension (must match `embedding_model`).
     pub embedding_dim: usize,
@@ -118,12 +131,38 @@ impl Config {
                 }),
             static_dir: std::env::var("AIBUDDY_STATIC_DIR").ok(),
 
+            llm_provider: std::env::var("AIBUDDY_LLM_PROVIDER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "litellm".to_string()),
             openrouter_api_key: std::env::var("AIBUDDY_OPENROUTER_API_KEY")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            litellm_api_key: std::env::var("AIBUDDY_LITELLM_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            litellm_base_url: std::env::var("AIBUDDY_LITELLM_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://litellm.osmosis.page/v1".to_string()),
             chat_model: std::env::var("AIBUDDY_CHAT_MODEL")
-                // Overridable; upgrade to the newest capable model in prod.
-                .unwrap_or_else(|_| "anthropic/claude-3.5-sonnet".to_string()),
+                // Overridable; the LiteLLM default routes to Claude Haiku.
+                .unwrap_or_else(|_| "openrouter/~anthropic/claude-haiku-latest".to_string()),
+            allowed_chat_models: std::env::var("AIBUDDY_ALLOWED_CHAT_MODELS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<String>>()
+                })
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    vec![
+                        "openrouter/~anthropic/claude-haiku-latest".to_string(),
+                        "gemma4-26b".to_string(),
+                    ]
+                }),
             embedding_model: std::env::var("AIBUDDY_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "openai/text-embedding-3-small".to_string()),
             embedding_dim: std::env::var("AIBUDDY_EMBEDDING_DIM")
@@ -264,6 +303,24 @@ mod tests {
 
         config.cookie_signing_key = "x".repeat(64);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn llm_defaults_are_litellm() {
+        let config = Config::from_env();
+        assert_eq!(config.llm_provider, "litellm");
+        assert_eq!(
+            config.chat_model,
+            "openrouter/~anthropic/claude-haiku-latest"
+        );
+        assert_eq!(
+            config.allowed_chat_models,
+            vec![
+                "openrouter/~anthropic/claude-haiku-latest".to_string(),
+                "gemma4-26b".to_string(),
+            ]
+        );
+        assert_eq!(config.litellm_base_url, "https://litellm.osmosis.page/v1");
     }
 
     #[test]

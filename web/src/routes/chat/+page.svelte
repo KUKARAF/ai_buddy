@@ -1,8 +1,22 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
-	import { createConversation, streamMessage, ApiError } from '$lib/api/client';
+	import { createConversation, streamMessage, getSettings, ApiError } from '$lib/api/client';
 	import { app } from '$lib/appState.svelte';
+
+	// The active coach model, shown as a small muted label in the header.
+	// Best-effort: a failure (guest/offline) just hides the label.
+	let activeModel = $state<string | null>(null);
+	onMount(async () => {
+		try {
+			const settings = await getSettings();
+			const match = settings.allowed_models.find((m) => m.id === settings.chat_model);
+			activeModel = match?.label ?? settings.chat_model;
+		} catch {
+			activeModel = null;
+		}
+	});
 
 	interface ChatMessage {
 		id: string;
@@ -74,6 +88,12 @@
 			<p class="muted">
 				Tell the coach what you want — it'll help you turn it into a small, doable plan.
 			</p>
+			{#if activeModel}
+				<a class="model-tag muted" href={resolve('/settings')}>
+					<Icon name="gear" size={13} />
+					{activeModel}
+				</a>
+			{/if}
 		</div>
 	</header>
 
@@ -151,6 +171,17 @@
 	.c-head p {
 		margin: 2px 0 0;
 		font-size: 14px;
+	}
+	.model-tag {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		margin-top: 6px;
+		font-size: 12px;
+		font-weight: 500;
+	}
+	.model-tag:hover {
+		color: var(--ink);
 	}
 	.badge {
 		width: 40px;

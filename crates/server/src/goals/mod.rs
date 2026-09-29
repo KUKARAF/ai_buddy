@@ -503,6 +503,7 @@ async fn persist_roadmap(
     state: &AppState,
     user_id: &str,
     goal_id: &str,
+    model: &str,
     draft: &RoadmapDraft,
 ) -> AppResult<String> {
     let now = now_rfc3339()?;
@@ -525,7 +526,7 @@ async fn persist_roadmap(
     sqlx::query("INSERT INTO roadmaps (id, goal_id, model, created_at) VALUES (?, ?, ?, ?)")
         .bind(&roadmap_id)
         .bind(goal_id)
-        .bind(&state.config.chat_model)
+        .bind(model)
         .bind(&now)
         .execute(&state.db)
         .await
@@ -652,10 +653,13 @@ async fn generate_roadmap(
 ) -> AppResult<Json<RoadmapView>> {
     let goal = owned_goal(&state.db, &user_id, &id).await?;
 
+    // Resolve the user's chosen chat model (falls back to the config default).
+    let model = crate::settings::user_chat_model(&state.db, &state.config, &user_id).await?;
+
     let user_prompt = roadmap_user_prompt(&goal);
     let (draft, cost_cents) = state
         .llm
-        .chat_json::<RoadmapDraft>(ROADMAP_SYSTEM_PROMPT, &user_prompt)
+        .chat_json::<RoadmapDraft>(&model, ROADMAP_SYSTEM_PROMPT, &user_prompt)
         .await?;
 
     if draft.steps.is_empty() {
@@ -664,7 +668,7 @@ async fn generate_roadmap(
         )));
     }
 
-    persist_roadmap(&state, &user_id, &goal.id, &draft).await?;
+    persist_roadmap(&state, &user_id, &goal.id, &model, &draft).await?;
 
     if cost_cents > 0 {
         crate::wallet::debit_tokens(&state.db, &user_id, cost_cents, "roadmap").await?;

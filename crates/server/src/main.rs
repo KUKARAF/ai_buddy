@@ -10,6 +10,7 @@ mod llm;
 mod mcp;
 mod notify;
 mod routes;
+mod settings;
 mod state;
 mod vector;
 mod wallet;

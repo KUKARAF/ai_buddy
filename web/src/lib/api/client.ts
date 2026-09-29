@@ -225,6 +225,20 @@ export interface SimilarGoals {
 	avg_score: number;
 }
 
+/** A model the coach may be configured to use (from GET /api/settings). */
+export interface ModelOption {
+	id: string;
+	label: string;
+}
+
+/** User-facing settings (GET /api/settings). */
+export interface Settings {
+	/** The model id currently used for chat + roadmaps. */
+	chat_model: string;
+	/** The models the backend allows; only these should be offered in the UI. */
+	allowed_models: ModelOption[];
+}
+
 // --- Typed API helpers --------------------------------------------------------
 
 /**
@@ -606,6 +620,30 @@ export function getSimilar(goalId: string, options?: RequestOptions): Promise<Si
 		'GET',
 		`/api/goals/${encodeURIComponent(goalId)}/similar`,
 		undefined,
+		options
+	);
+}
+
+// --- Settings -----------------------------------------------------------------
+
+/** GET /api/settings — the current chat model plus the allowed choices. */
+export function getSettings(options?: RequestOptions): Promise<Settings> {
+	return request<Settings>('GET', '/api/settings', undefined, options);
+}
+
+/**
+ * PUT /api/settings — change the chat model. Returns the saved value.
+ * The backend responds 400 (ApiError.status === 400) if `chatModel` is not one
+ * of the allowed models.
+ */
+export function updateSettings(
+	chatModel: string,
+	options?: RequestOptions
+): Promise<{ chat_model: string }> {
+	return request<{ chat_model: string }>(
+		'PUT',
+		'/api/settings',
+		{ chat_model: chatModel },
 		options
 	);
 }

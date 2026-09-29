@@ -1,14 +1,23 @@
-//! LLM (OpenRouter) chat + embeddings client.
+//! LLM chat + embeddings client.
 //!
-//! Wraps the OpenRouter REST API for:
+//! Chat/roadmap completions are served by a configurable, OpenAI-compatible
+//! provider — the LiteLLM proxy by default, or OpenRouter when
+//! `AIBUDDY_LLM_PROVIDER=openrouter` (the revert switch). Embeddings ALWAYS go
+//! to OpenRouter (LiteLLM has no embeddings endpoint).
+//!
+//! Exposes:
 //!   - non-streaming chat ([`LlmClient::chat`]),
 //!   - streaming chat ([`LlmClient::chat_stream`]) yielding [`ChatDelta`]s,
 //!   - JSON-mode structured completion ([`LlmClient::chat_json`]),
 //!   - single-text embeddings ([`LlmClient::embed`]).
 //!
+//! The chat methods take an explicit `model` so callers can honour a user's
+//! per-user model choice (see [`crate::settings`]). Use [`LlmClient::resolve_model`]
+//! to validate a requested id against the allowed list before calling.
+//!
 //! Every call returns an approximate token cost in euro cents (see
 //! [`cost_cents`]); this is the value the wallet debits. The rate table is
-//! approximate and overridable — keep it roughly in line with OpenRouter's
+//! approximate and overridable — keep it roughly in line with the provider's
 //! published prices.
 
 use std::time::Duration;
@@ -20,7 +29,9 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 
-const CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// OpenRouter chat completions endpoint. Retained so switching back to the
+/// OpenRouter chat path (`AIBUDDY_LLM_PROVIDER=openrouter`) is trivial.
+const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const EMBED_URL: &str = "https://openrouter.ai/api/v1/embeddings";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -61,8 +72,16 @@ pub struct LlmClient {
 
 struct Inner {
     http: reqwest::Client,
-    api_key: Option<String>,
-    chat_model: String,
+    /// Full chat completions URL (provider-dependent).
+    chat_url: String,
+    /// API key for the chat provider (LiteLLM or OpenRouter).
+    chat_api_key: Option<String>,
+    /// Default chat model when the caller passes an unknown/empty model.
+    default_chat_model: String,
+    /// Chat model ids a user may select.
+    allowed_chat_models: Vec<String>,
+    /// Embeddings always use OpenRouter, so keep its key separately.
+    embed_api_key: Option<String>,
     embedding_model: String,
     #[allow(dead_code)]
     embedding_dim: usize,
@@ -79,42 +98,92 @@ impl LlmClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
+        // Pick the chat endpoint + key by provider. Embeddings always use
+        // OpenRouter regardless of this choice.
+        let (chat_url, chat_api_key) = if config.llm_provider == "openrouter" {
+            (
+                OPENROUTER_CHAT_URL.to_string(),
+                config.openrouter_api_key.clone(),
+            )
+        } else {
+            // Default / "litellm": OpenAI-compatible base + /chat/completions.
+            (
+                format!(
+                    "{}/chat/completions",
+                    config.litellm_base_url.trim_end_matches('/')
+                ),
+                config.litellm_api_key.clone(),
+            )
+        };
+
         Self {
             inner: std::sync::Arc::new(Inner {
                 http,
-                api_key: config.openrouter_api_key.clone(),
-                chat_model: config.chat_model.clone(),
+                chat_url,
+                chat_api_key,
+                default_chat_model: config.chat_model.clone(),
+                allowed_chat_models: config.allowed_chat_models.clone(),
+                embed_api_key: config.openrouter_api_key.clone(),
                 embedding_model: config.embedding_model.clone(),
                 embedding_dim: config.embedding_dim,
             }),
         }
     }
 
-    fn require_key(&self) -> AppResult<&str> {
+    /// The configured default chat model.
+    pub fn default_chat_model(&self) -> &str {
+        &self.inner.default_chat_model
+    }
+
+    /// Resolve a requested model to a usable one: return `requested` when it is
+    /// in the allowed list, otherwise fall back to the default.
+    pub fn resolve_model(&self, requested: Option<&str>) -> String {
+        match requested {
+            Some(m) if self.inner.allowed_chat_models.iter().any(|a| a == m) => m.to_string(),
+            _ => self.inner.default_chat_model.clone(),
+        }
+    }
+
+    /// The chat provider's API key, or a `BadRequest` when unconfigured.
+    fn require_chat_key(&self) -> AppResult<&str> {
         self.inner
-            .api_key
+            .chat_api_key
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("LLM API key not configured".to_string()))
+    }
+
+    /// The OpenRouter API key used for embeddings, or a `BadRequest` when unset.
+    fn require_embed_key(&self) -> AppResult<&str> {
+        self.inner
+            .embed_api_key
             .as_deref()
             .ok_or_else(|| AppError::BadRequest("OpenRouter API key not configured".to_string()))
     }
 
-    /// Non-streaming chat completion. `system` is prepended as a `system`
-    /// message (when non-empty). Returns the assistant text + cost estimate.
-    pub async fn chat(&self, system: &str, messages: &[ChatMsg]) -> AppResult<ChatOutcome> {
-        let key = self.require_key()?;
+    /// Non-streaming chat completion with an explicit `model`. `system` is
+    /// prepended as a `system` message (when non-empty). Returns the assistant
+    /// text + cost estimate.
+    pub async fn chat(
+        &self,
+        model: &str,
+        system: &str,
+        messages: &[ChatMsg],
+    ) -> AppResult<ChatOutcome> {
+        let key = self.require_chat_key()?;
         let body = serde_json::json!({
-            "model": self.inner.chat_model,
+            "model": model,
             "messages": build_messages(system, messages),
         });
 
         let resp = self
             .inner
             .http
-            .post(CHAT_URL)
+            .post(&self.inner.chat_url)
             .bearer_auth(key)
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Internal(anyhow!("OpenRouter request failed: {e}")))?;
+            .map_err(|e| AppError::Internal(anyhow!("LLM request failed: {e}")))?;
 
         let parsed: ChatResponse = read_json(resp).await?;
         let text = parsed
@@ -122,12 +191,12 @@ impl LlmClient {
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .ok_or_else(|| AppError::Internal(anyhow!("OpenRouter returned no content")))?;
+            .ok_or_else(|| AppError::Internal(anyhow!("LLM returned no content")))?;
 
         let (pt, ct) = parsed.usage.unwrap_or_default().tokens();
         Ok(ChatOutcome {
             text,
-            cost_cents: cost_cents(&self.inner.chat_model, pt, ct),
+            cost_cents: cost_cents(model, pt, ct),
         })
     }
 
@@ -137,12 +206,13 @@ impl LlmClient {
     /// Returns `(T, cost_cents)`.
     pub async fn chat_json<T: DeserializeOwned>(
         &self,
+        model: &str,
         system: &str,
         user: &str,
     ) -> AppResult<(T, i64)> {
-        let key = self.require_key()?;
+        let key = self.require_chat_key()?;
         let body = serde_json::json!({
-            "model": self.inner.chat_model,
+            "model": model,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user },
@@ -154,12 +224,12 @@ impl LlmClient {
         let resp = self
             .inner
             .http
-            .post(CHAT_URL)
+            .post(&self.inner.chat_url)
             .bearer_auth(key)
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Internal(anyhow!("OpenRouter request failed: {e}")))?;
+            .map_err(|e| AppError::Internal(anyhow!("LLM request failed: {e}")))?;
 
         let parsed: ChatResponse = read_json(resp).await?;
         let content = parsed
@@ -167,7 +237,7 @@ impl LlmClient {
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .ok_or_else(|| AppError::Internal(anyhow!("OpenRouter returned no content")))?;
+            .ok_or_else(|| AppError::Internal(anyhow!("LLM returned no content")))?;
 
         let json = extract_json(&content)
             .ok_or_else(|| AppError::Internal(anyhow!("no JSON object in model output")))?;
@@ -175,7 +245,7 @@ impl LlmClient {
             .map_err(|e| AppError::Internal(anyhow!("could not parse model JSON: {e}")))?;
 
         let (pt, ct) = parsed.usage.unwrap_or_default().tokens();
-        Ok((value, cost_cents(&self.inner.chat_model, pt, ct)))
+        Ok((value, cost_cents(model, pt, ct)))
     }
 
     /// Streaming chat completion. Yields a [`ChatDelta::Token`] per delta, then a
@@ -184,12 +254,13 @@ impl LlmClient {
     /// are split across network chunks.
     pub async fn chat_stream(
         &self,
+        model: &str,
         system: &str,
         messages: &[ChatMsg],
     ) -> AppResult<impl futures::Stream<Item = ChatDelta> + Send> {
-        let key = self.require_key()?;
+        let key = self.require_chat_key()?;
         let body = serde_json::json!({
-            "model": self.inner.chat_model,
+            "model": model,
             "messages": build_messages(system, messages),
             "stream": true,
             "stream_options": { "include_usage": true },
@@ -198,28 +269,26 @@ impl LlmClient {
         let resp = self
             .inner
             .http
-            .post(CHAT_URL)
+            .post(&self.inner.chat_url)
             .bearer_auth(key)
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Internal(anyhow!("OpenRouter request failed: {e}")))?;
+            .map_err(|e| AppError::Internal(anyhow!("LLM request failed: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
             let raw = resp.text().await.unwrap_or_default();
             if status.as_u16() == 401 {
                 return Err(AppError::BadRequest(
-                    "OpenRouter rejected the API key".to_string(),
+                    "LLM provider rejected the API key".to_string(),
                 ));
             }
-            return Err(AppError::Internal(anyhow!(
-                "OpenRouter returned {status}: {raw}"
-            )));
+            return Err(AppError::Internal(anyhow!("LLM returned {status}: {raw}")));
         }
 
         let (tx, rx) = futures::channel::mpsc::unbounded::<ChatDelta>();
-        let model = self.inner.chat_model.clone();
+        let model = model.to_string();
 
         tokio::spawn(async move {
             let mut bytes = resp.bytes_stream();
@@ -283,7 +352,7 @@ impl LlmClient {
     /// endpoint error the [`AppError`] is returned so callers can treat RAG as
     /// best-effort.
     pub async fn embed(&self, text: &str) -> AppResult<(Vec<f32>, i64)> {
-        let key = self.require_key()?;
+        let key = self.require_embed_key()?;
         let body = serde_json::json!({
             "model": self.inner.embedding_model,
             "input": text,
@@ -423,6 +492,11 @@ fn model_rate(model: &str) -> (f64, f64) {
         "anthropic/claude-3-opus" => (15.0, 75.0),
         "openai/gpt-4o" => (2.5, 10.0),
         "openai/gpt-4o-mini" => (0.15, 0.60),
+        // LiteLLM-proxied models. Haiku ~ claude-haiku pricing; gemma is a small
+        // local/self-hosted model, so treat it as near-free (min 1 cent still
+        // applies to any chat call).
+        "openrouter/~anthropic/claude-haiku-latest" => (0.80, 4.0),
+        "gemma4-26b" => (0.2, 0.2),
         // Conservative default so an unknown model never under-charges the wallet.
         _ => (5.0, 15.0),
     }
@@ -533,6 +607,35 @@ mod tests {
     fn cost_cents_unknown_model_uses_default_rate() {
         // default prompt rate 5 USD/1M: 5 * 0.92 * 100 = 460.
         assert_eq!(cost_cents("some/unknown-model", 1_000_000, 0), 460);
+    }
+
+    #[test]
+    fn cost_cents_litellm_models() {
+        // Haiku completion: 4 USD/1M * 1_000_000 = 4 USD * 0.92 * 100 = 368.
+        assert_eq!(
+            cost_cents("openrouter/~anthropic/claude-haiku-latest", 0, 1_000_000),
+            368
+        );
+        // gemma is near-free but chat still floors at 1 cent.
+        assert_eq!(cost_cents("gemma4-26b", 0, 0), 1);
+    }
+
+    #[test]
+    fn resolve_model_honours_allowed_list() {
+        let client = LlmClient::new(&Config::from_env());
+        // The config default is always allowed.
+        assert_eq!(
+            client.default_chat_model(),
+            "openrouter/~anthropic/claude-haiku-latest"
+        );
+        // An allowed model is returned as-is.
+        assert_eq!(client.resolve_model(Some("gemma4-26b")), "gemma4-26b");
+        // A disallowed / absent model falls back to the default.
+        assert_eq!(
+            client.resolve_model(Some("not-allowed")),
+            client.default_chat_model()
+        );
+        assert_eq!(client.resolve_model(None), client.default_chat_model());
     }
 
     #[test]

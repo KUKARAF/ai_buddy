@@ -16,6 +16,7 @@ use crate::checkins;
 use crate::circles;
 use crate::goals;
 use crate::notify;
+use crate::settings;
 use crate::state::AppState;
 use crate::wallet;
 
@@ -40,6 +41,7 @@ pub fn build(state: AppState) -> Router {
         .merge(chat::router())
         .merge(checkins::router())
         .merge(circles::router())
+        .merge(settings::router())
         .merge(wallet::router())
         .merge(notify::router())
         .layer(TimeoutLayer::with_status_code(

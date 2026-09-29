@@ -354,9 +354,12 @@ async fn post_message(
         format!("{rag}\n{COACH_SYSTEM_PROMPT}")
     };
 
-    // 6. Start the upstream token stream. A pre-stream error (missing key / 402 /
+    // 6. Resolve the user's chosen chat model (falls back to the config default).
+    let model = crate::settings::user_chat_model(&state.db, &state.config, &user_id).await?;
+
+    // 7. Start the upstream token stream. A pre-stream error (missing key / 402 /
     //    provider reject) is returned directly, before any SSE is constructed.
-    let mut token_stream = state.llm.chat_stream(&system, &history).await?;
+    let mut token_stream = state.llm.chat_stream(&model, &system, &history).await?;
 
     let (tx, rx) = mpsc::unbounded::<Result<Event, Infallible>>();
     let task_state = state.clone();

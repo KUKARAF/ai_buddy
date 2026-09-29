@@ -26,6 +26,7 @@
 
 	const path = $derived(page.url.pathname);
 	const home = resolve('/');
+	const settingsPath = resolve('/settings');
 
 	// `target` is an already-resolved path (from resolve()).
 	function isActive(target: string): boolean {
@@ -40,6 +41,7 @@
 		if (path.startsWith(resolve('/wallet'))) return 'Your wallet';
 		if (path.startsWith(resolve('/discover'))) return 'Discover';
 		if (path.startsWith(resolve('/circles'))) return 'My circles';
+		if (path.startsWith(settingsPath)) return 'Settings';
 		return 'Today';
 	});
 
@@ -100,7 +102,6 @@
 						<span class="muted small">{app.me.email}</span>
 					{/if}
 				</span>
-				<Icon name="gear" size={18} />
 			{:else}
 				<span class="avatar">G</span>
 				<span class="who">
@@ -108,8 +109,16 @@
 					<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- external OIDC login URL -->
 					<a class="signin small" href={loginUrl()}>Sign in</a>
 				</span>
-				<Icon name="gear" size={18} />
 			{/if}
+			<a
+				class="gearbtn"
+				class:active={isActive(settingsPath)}
+				href={settingsPath}
+				aria-label="Settings"
+				onclick={() => (menuOpen = false)}
+			>
+				<Icon name="gear" size={18} />
+			</a>
 		</div>
 	</aside>
 
@@ -292,6 +301,24 @@
 	.signin {
 		color: var(--sky-ink);
 		font-weight: 600;
+	}
+	.gearbtn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 34px;
+		height: 34px;
+		border-radius: 10px;
+		color: var(--muted);
+		flex: none;
+	}
+	.gearbtn:hover {
+		color: var(--ink);
+		background: var(--tag-bg);
+	}
+	.gearbtn.active {
+		background: rgba(200, 220, 170, 0.35);
+		color: var(--ink);
 	}
 
 	/* ---- main ---- */
