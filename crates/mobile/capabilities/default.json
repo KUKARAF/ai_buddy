@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/capabilities/2",
+  "identifier": "default",
+  "description": "Default permissions for the AI Buddy Android app. Note: tauri-plugin-edge-to-edge is deliberately absent - its published permission set is broken (references a nonexistent command) and its CSS-variable injection is automatic, needing no permissions.",
+  "windows": ["main"],
+  "platforms": ["android"],
+  "permissions": ["core:default", "deep-link:default", "opener:default"]
+}

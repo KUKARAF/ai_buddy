@@ -1,0 +1,46 @@
+[package]
+name = "mobile"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "ai_buddy_mobile"
+crate-type = ["staticlib", "cdylib", "lib"]
+path = "src/lib.rs"
+
+[dependencies]
+ai-buddy-core = { workspace = true }
+tauri = { workspace = true }
+# Required in scope by `tauri::generate_context!` codegen once a `plugins`
+# config section exists (the deep-link config is deserialized via serde_json).
+serde_json = { workspace = true }
+
+# Injects the Android system-bar insets as CSS variables
+# (--safe-area-inset-*) on the webview's documentElement — the Android
+# System WebView doesn't reliably plumb env(safe-area-inset-*) (returns 0
+# before WebView 140), and the generated gen/android project can't be
+# customized (CI regenerates it), so a plugin is the only persistable fix.
+# Pinned exactly: young single-maintainer crate; its published permission
+# set is broken (references a nonexistent `ping` command), so it must NOT
+# be listed in capabilities/ — the CSS injection is automatic on load and
+# needs no permissions.
+tauri-plugin-edge-to-edge = "=0.3.3"
+
+# NOTE: rust_note's mobile crate also depends on `tauri-plugin-android-fs`
+# (SAF folder picker + persisted grants) for its notes-folder mirror.
+# AI Buddy has no notes-folder / directory-picker feature (see
+# docs/ARCHITECTURE.md — no such module exists), so that plugin is
+# deliberately omitted here. It would only add an unused, version-locked
+# IPC contract with an npm binding and an unneeded Android permission.
+
+# OIDC login: open the OS browser (opener) for the OAuth flow and receive the
+# device token back via the `dev.aibuddy.app://auth` custom-scheme deep link
+# (deep-link). Keep in lockstep with the @tauri-apps/plugin-* npm packages.
+tauri-plugin-deep-link = "2.4.9"
+tauri-plugin-opener = "2.5.4"
+
+[build-dependencies]
+tauri-build = { version = "2" }

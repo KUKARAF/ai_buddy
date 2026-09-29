@@ -1,0 +1,33 @@
+services:
+  aibuddy:
+    # Published by .github/workflows/docker-publish.yml on every main push.
+    # First-time setup: the GHCR package starts private — make it public once
+    # (GitHub -> Packages -> ai_buddy -> package settings) or `docker login
+    # ghcr.io` on this host with a read:packages token.
+    image: ghcr.io/kukaraf/ai_buddy:latest
+    container_name: aibuddy
+    restart: unless-stopped
+    # No host bind-mount anymore (data lives in the named volume below), so the
+    # `user: "1004:1004"` host-uid mapping rust_note used is unneeded here.
+    env_file:
+      - .env
+    environment:
+      - AIBUDDY_BASE_URL=https://aibuddy.example.com
+      - AIBUDDY_AUTHENTIK_ISSUER_URL=https://auth.example.com/application/o/ai-buddy/
+      - AIBUDDY_OIDC_CLIENT_ID=ai-buddy
+      - AIBUDDY_OIDC_REDIRECT_URI=https://aibuddy.example.com/auth/callback
+      # No AIBUDDY_OIDC_CLIENT_SECRET: this Authentik provider is a Public
+      # client (PKCE-only, no shared secret).
+      - AIBUDDY_SQLITE_PATH=/data/db/ai_buddy.db
+    volumes:
+      - aibuddy_db:/data/db
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+    name: caddy_proxy
+
+volumes:
+  aibuddy_db:

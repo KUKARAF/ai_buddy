@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = ["crates/server", "crates/core", "crates/mobile"]
+# `crates/mobile` only *compiles* under the Android/Tauri toolchain (NDK), so
+# host CI builds/tests use `--workspace --exclude mobile`. It is still a member
+# so the whole tree shares one Cargo.lock (dependency resolution — not
+# compilation — works fine on a plain host).
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+tokio = { version = "1.53", features = ["full"] }
+axum = { version = "0.8" }
+axum-extra = { version = "0.12", features = ["cookie", "cookie-private", "cookie-key-expansion", "with-rejection"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "cors", "timeout"] }
+# Pinned to 0.14 to match the tower-sessions-sqlx-store 0.15 line (same rationale
+# as the sibling rust_note project: 0.15's stores disagree on tower-sessions-core).
+tower-sessions = "0.14"
+tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
+
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate"] }
+openidconnect = "4.0"
+# Outbound HTTP for OpenRouter (chat + embeddings). rustls-only (no native-tls);
+# `stream` enables `bytes_stream()` for SSE streaming of chat tokens.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Remote MCP server (Model Context Protocol) — same stack as rust_note.
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+# JWT validation for the MCP OAuth Resource Server (pure-Rust crypto backend).
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+base64 = "0.22"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+uuid = { version = "1.24", features = ["v4"] }
+rand = "0.10"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+futures = "0.3"
+
+tauri = "2.11"
+tempfile = "3.14"
+
+ai-buddy-core = { path = "crates/core" }
+
+# Panic-safety gate (see rust_note's rationale). These deny lints only affect
+# `cargo clippy`, never `cargo build`/`check`. Test code is exempted via
+# clippy.toml's allow-*-in-tests keys. Each crate opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
