@@ -1,5 +1,6 @@
 mod auth;
 mod chat;
+mod checkins;
 mod config;
 mod db;
 mod error;

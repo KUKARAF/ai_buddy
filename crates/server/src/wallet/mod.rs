@@ -16,6 +16,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::WithRejection;
@@ -149,7 +150,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/wallet", get(get_wallet))
         .route("/api/wallet/topup", post(topup))
         .route("/api/wallet/ledger", get(get_ledger))
-        .route("/api/goals/{id}/pledge", post(propose_pledge))
+        .route(
+            "/api/goals/{id}/pledge",
+            get(get_pledge).post(propose_pledge),
+        )
         .route("/api/goals/{id}/pledge/confirm", post(confirm_pledge))
         .route("/api/webhooks/stripe", post(stripe_webhook))
 }
@@ -322,6 +326,54 @@ async fn load_pledge(pool: &SqlitePool, goal_id: &str) -> AppResult<PledgeView> 
     })
 }
 
+/// Load the caller's pledge for `goal_id`, scoped by ownership (the pledge row's
+/// `user_id` must equal `user_id`). Returns `None` when no matching pledge exists
+/// — either the goal has no pledge, or it belongs to another user.
+#[allow(clippy::type_complexity)]
+async fn load_pledge_for_user(
+    pool: &SqlitePool,
+    goal_id: &str,
+    user_id: &str,
+) -> AppResult<Option<PledgeView>> {
+    let row: Option<(String, String, String, i64, String, String, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, goal_id, user_id, amount_cents, status, created_at, resolved_at \
+         FROM pledges WHERE goal_id = ? AND user_id = ?",
+        )
+        .bind(goal_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    Ok(row.map(
+        |(id, goal_id, user_id, amount_cents, status, created_at, resolved_at)| PledgeView {
+            id,
+            goal_id,
+            user_id,
+            amount_cents,
+            status,
+            created_at,
+            resolved_at,
+        },
+    ))
+}
+
+/// Read the caller's current pledge for a goal. Returns `200` with the pledge
+/// (shaped like [`PledgeView`]) when one exists and belongs to the caller,
+/// otherwise `204 No Content`. Lets the frontend show held/refunded/forfeited
+/// state without proposing a new pledge.
+async fn get_pledge(
+    State(state): State<AppState>,
+    RequireAuth(user_id): RequireAuth,
+    Path(goal_id): Path<String>,
+) -> AppResult<Response> {
+    match load_pledge_for_user(&state.db, &goal_id, &user_id).await? {
+        Some(view) => Ok(Json(view).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
 async fn propose_pledge(
     State(state): State<AppState>,
     RequireAuth(user_id): RequireAuth,
@@ -439,4 +491,78 @@ async fn stripe_webhook(
     }
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let path = db_path.to_str().expect("utf8 path");
+        let pool = crate::db::init_pool(path).await.expect("init pool");
+        for id in ["u1", "u2"] {
+            sqlx::query(
+                "INSERT INTO users (id, email, display_name, created_at) \
+                 VALUES (?, NULL, NULL, '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("insert user");
+        }
+        (dir, pool)
+    }
+
+    async fn insert_pledge(pool: &SqlitePool, goal_id: &str, user_id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO pledges (id, goal_id, user_id, amount_cents, status, created_at, resolved_at) \
+             VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', NULL)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(goal_id)
+        .bind(user_id)
+        .bind(500_i64)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert pledge");
+    }
+
+    #[tokio::test]
+    async fn get_pledge_returns_owner_pledge() {
+        let (_dir, pool) = test_pool().await;
+        insert_pledge(&pool, "goal-1", "u1", "held").await;
+
+        let view = load_pledge_for_user(&pool, "goal-1", "u1")
+            .await
+            .expect("query")
+            .expect("pledge present");
+        assert_eq!(view.goal_id, "goal-1");
+        assert_eq!(view.user_id, "u1");
+        assert_eq!(view.amount_cents, 500);
+        assert_eq!(view.status, "held");
+    }
+
+    #[tokio::test]
+    async fn get_pledge_none_when_absent() {
+        let (_dir, pool) = test_pool().await;
+        let result = load_pledge_for_user(&pool, "goal-missing", "u1")
+            .await
+            .expect("query");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_pledge_does_not_return_other_users_pledge() {
+        let (_dir, pool) = test_pool().await;
+        // A pledge on goal-2 owned by u2 must not surface for u1.
+        insert_pledge(&pool, "goal-2", "u2", "proposed").await;
+
+        let result = load_pledge_for_user(&pool, "goal-2", "u1")
+            .await
+            .expect("query");
+        assert!(result.is_none());
+    }
 }

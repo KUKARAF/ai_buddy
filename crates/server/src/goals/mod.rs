@@ -40,6 +40,10 @@ pub struct GoalView {
     pub deadline: Option<String>,
     pub status: String,
     pub progress_note: Option<String>,
+    pub location: Option<String>,
+    pub skill_level: Option<String>,
+    pub success_criterion: Option<String>,
+    pub time_per_session_min: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -76,6 +80,14 @@ struct CreateGoal {
     category: Option<String>,
     #[serde(default)]
     deadline: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    skill_level: Option<String>,
+    #[serde(default)]
+    success_criterion: Option<String>,
+    #[serde(default)]
+    time_per_session_min: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +102,14 @@ struct PatchGoal {
     status: Option<String>,
     #[serde(default)]
     progress_note: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    skill_level: Option<String>,
+    #[serde(default)]
+    success_criterion: Option<String>,
+    #[serde(default)]
+    time_per_session_min: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +201,7 @@ async fn embed_upsert(state: &AppState, user_id: &str, kind: &str, source_id: &s
 async fn fetch_goal(pool: &SqlitePool, id: &str) -> AppResult<Option<GoalView>> {
     sqlx::query_as::<_, GoalView>(
         "SELECT id, user_id, title, description, category, deadline, status, progress_note, \
+                location, skill_level, success_criterion, time_per_session_min, \
                 created_at, updated_at \
          FROM goals WHERE id = ?",
     )
@@ -200,6 +221,7 @@ async fn owned_goal(pool: &SqlitePool, user_id: &str, id: &str) -> AppResult<Goa
     Ok(goal)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_goal(
     pool: &SqlitePool,
     user_id: &str,
@@ -207,6 +229,10 @@ async fn insert_goal(
     description: Option<&str>,
     category: Option<&str>,
     deadline: Option<&str>,
+    location: Option<&str>,
+    skill_level: Option<&str>,
+    success_criterion: Option<&str>,
+    time_per_session_min: Option<i64>,
 ) -> AppResult<GoalView> {
     let title = title.trim();
     if title.is_empty() {
@@ -217,8 +243,9 @@ async fn insert_goal(
     sqlx::query(
         "INSERT INTO goals \
              (id, user_id, title, description, category, deadline, status, progress_note, \
+              location, skill_level, success_criterion, time_per_session_min, \
               created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(user_id)
@@ -227,6 +254,10 @@ async fn insert_goal(
     .bind(category)
     .bind(deadline)
     .bind(GoalStatus::Draft.as_str())
+    .bind(location)
+    .bind(skill_level)
+    .bind(success_criterion)
+    .bind(time_per_session_min)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -239,6 +270,7 @@ async fn insert_goal(
 async fn list_goals_for(pool: &SqlitePool, user_id: &str) -> AppResult<Vec<GoalView>> {
     sqlx::query_as::<_, GoalView>(
         "SELECT id, user_id, title, description, category, deadline, status, progress_note, \
+                location, skill_level, success_criterion, time_per_session_min, \
                 created_at, updated_at \
          FROM goals WHERE user_id = ? ORDER BY created_at DESC, id DESC",
     )
@@ -281,11 +313,24 @@ async fn apply_goal_patch(
     if let Some(note) = patch.progress_note {
         goal.progress_note = Some(note);
     }
+    if let Some(location) = patch.location {
+        goal.location = Some(location);
+    }
+    if let Some(skill_level) = patch.skill_level {
+        goal.skill_level = Some(skill_level);
+    }
+    if let Some(success_criterion) = patch.success_criterion {
+        goal.success_criterion = Some(success_criterion);
+    }
+    if let Some(time_per_session_min) = patch.time_per_session_min {
+        goal.time_per_session_min = Some(time_per_session_min);
+    }
     goal.updated_at = now_rfc3339()?;
 
     sqlx::query(
         "UPDATE goals SET title = ?, description = ?, category = ?, deadline = ?, status = ?, \
-                progress_note = ?, updated_at = ? \
+                progress_note = ?, location = ?, skill_level = ?, success_criterion = ?, \
+                time_per_session_min = ?, updated_at = ? \
          WHERE id = ?",
     )
     .bind(&goal.title)
@@ -294,6 +339,10 @@ async fn apply_goal_patch(
     .bind(&goal.deadline)
     .bind(&goal.status)
     .bind(&goal.progress_note)
+    .bind(&goal.location)
+    .bind(&goal.skill_level)
+    .bind(&goal.success_criterion)
+    .bind(goal.time_per_session_min)
     .bind(&goal.updated_at)
     .bind(&goal.id)
     .execute(pool)
@@ -414,6 +463,28 @@ fn roadmap_user_prompt(goal: &GoalView) -> String {
     if let Some(deadline) = goal.deadline.as_deref() {
         if !deadline.trim().is_empty() {
             out.push_str(&format!("Deadline: {deadline}\n"));
+        }
+    }
+    if let Some(location) = goal.location.as_deref() {
+        if !location.trim().is_empty() {
+            out.push_str(&format!("Location / setting: {location}\n"));
+        }
+    }
+    if let Some(skill_level) = goal.skill_level.as_deref() {
+        if !skill_level.trim().is_empty() {
+            out.push_str(&format!("Starting point / skill level: {skill_level}\n"));
+        }
+    }
+    if let Some(success) = goal.success_criterion.as_deref() {
+        if !success.trim().is_empty() {
+            out.push_str(&format!(
+                "Definition of success (the finish line): {success}\n"
+            ));
+        }
+    }
+    if let Some(minutes) = goal.time_per_session_min {
+        if minutes > 0 {
+            out.push_str(&format!("Time available per session: {minutes} minutes\n"));
         }
     }
     if let Some(note) = goal.progress_note.as_deref() {
@@ -538,6 +609,10 @@ async fn create_goal(
         body.description.as_deref(),
         body.category.as_deref(),
         body.deadline.as_deref(),
+        body.location.as_deref(),
+        body.skill_level.as_deref(),
+        body.success_criterion.as_deref(),
+        body.time_per_session_min,
     )
     .await?;
 
@@ -668,6 +743,10 @@ mod tests {
             Some("from couch"),
             None,
             Some("2026-12-01"),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("insert");
@@ -682,9 +761,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_with_new_fields_roundtrips() {
+        let (_dir, pool) = test_pool().await;
+
+        let goal = insert_goal(
+            &pool,
+            "u1",
+            "Learn to surf",
+            Some("catch a green wave"),
+            Some("sport"),
+            Some("2026-12-01"),
+            Some("Ericeira, Portugal"),
+            Some("total beginner"),
+            Some("ride an unbroken wave for 5 seconds"),
+            Some(90),
+        )
+        .await
+        .expect("insert");
+
+        assert_eq!(goal.location.as_deref(), Some("Ericeira, Portugal"));
+        assert_eq!(goal.skill_level.as_deref(), Some("total beginner"));
+        assert_eq!(
+            goal.success_criterion.as_deref(),
+            Some("ride an unbroken wave for 5 seconds")
+        );
+        assert_eq!(goal.time_per_session_min, Some(90));
+
+        // Read back through fetch to confirm the SELECT column list maps correctly.
+        let fetched = owned_goal(&pool, "u1", &goal.id).await.expect("get");
+        assert_eq!(fetched.location.as_deref(), Some("Ericeira, Portugal"));
+        assert_eq!(fetched.skill_level.as_deref(), Some("total beginner"));
+        assert_eq!(
+            fetched.success_criterion.as_deref(),
+            Some("ride an unbroken wave for 5 seconds")
+        );
+        assert_eq!(fetched.time_per_session_min, Some(90));
+
+        // And through the list query (separate SELECT column list).
+        let listed = list_goals_for(&pool, "u1").await.expect("list");
+        assert_eq!(listed.len(), 1);
+        let first = listed.first().expect("one goal");
+        assert_eq!(first.time_per_session_min, Some(90));
+
+        // Patch a subset of the new fields and confirm they persist.
+        let patched = apply_goal_patch(
+            &pool,
+            "u1",
+            &goal.id,
+            PatchGoal {
+                skill_level: Some("can stand on the board".to_string()),
+                time_per_session_min: Some(60),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("patch");
+        assert_eq!(
+            patched.skill_level.as_deref(),
+            Some("can stand on the board")
+        );
+        assert_eq!(patched.time_per_session_min, Some(60));
+        // Untouched new field is preserved.
+        assert_eq!(patched.location.as_deref(), Some("Ericeira, Portugal"));
+    }
+
+    #[tokio::test]
     async fn empty_title_is_rejected() {
         let (_dir, pool) = test_pool().await;
-        let err = insert_goal(&pool, "u1", "   ", None, None, None)
+        let err = insert_goal(&pool, "u1", "   ", None, None, None, None, None, None, None)
             .await
             .expect_err("should reject");
         assert!(matches!(err, AppError::BadRequest(_)));
@@ -693,9 +837,11 @@ mod tests {
     #[tokio::test]
     async fn ownership_is_enforced() {
         let (_dir, pool) = test_pool().await;
-        let goal = insert_goal(&pool, "owner", "Mine", None, None, None)
-            .await
-            .expect("insert");
+        let goal = insert_goal(
+            &pool, "owner", "Mine", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
 
         // Wrong owner -> Forbidden.
         let err = owned_goal(&pool, "intruder", &goal.id)
@@ -713,9 +859,11 @@ mod tests {
     #[tokio::test]
     async fn patch_updates_fields_and_validates_status() {
         let (_dir, pool) = test_pool().await;
-        let goal = insert_goal(&pool, "u1", "Original", None, None, None)
-            .await
-            .expect("insert");
+        let goal = insert_goal(
+            &pool, "u1", "Original", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
 
         let patched = apply_goal_patch(
             &pool,
@@ -757,9 +905,11 @@ mod tests {
     #[tokio::test]
     async fn step_status_update_checks_ownership() {
         let (_dir, pool) = test_pool().await;
-        let goal = insert_goal(&pool, "u1", "Goal", None, None, None)
-            .await
-            .expect("insert");
+        let goal = insert_goal(
+            &pool, "u1", "Goal", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
 
         // Hand-roll a roadmap + one step for the goal.
         let now = now_rfc3339().expect("now");
@@ -812,9 +962,11 @@ mod tests {
     #[tokio::test]
     async fn fetch_roadmap_returns_ordered_steps() {
         let (_dir, pool) = test_pool().await;
-        let goal = insert_goal(&pool, "u1", "Goal", None, None, None)
-            .await
-            .expect("insert");
+        let goal = insert_goal(
+            &pool, "u1", "Goal", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
 
         let now = now_rfc3339().expect("now");
         sqlx::query(

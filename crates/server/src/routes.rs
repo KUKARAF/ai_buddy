@@ -12,6 +12,7 @@ use tower_http::timeout::TimeoutLayer;
 
 use crate::auth;
 use crate::chat;
+use crate::checkins;
 use crate::goals;
 use crate::notify;
 use crate::state::AppState;
@@ -36,6 +37,7 @@ pub fn build(state: AppState) -> Router {
         .merge(auth::oidc::router())
         .merge(goals::router())
         .merge(chat::router())
+        .merge(checkins::router())
         .merge(wallet::router())
         .merge(notify::router())
         .layer(TimeoutLayer::with_status_code(
