@@ -305,13 +305,14 @@
 											<p class="eyebrow">Milestone {i + 1}</p>
 											<h3>{step.title}</h3>
 											{#if step.detail}<p class="muted">{step.detail}</p>{/if}
-											<span class="chip-status" class:completed={step.status === 'done'}>
-												{#if step.status === 'done'}
-													Completed
-												{:else}
-													{goal.time_per_session_min ?? 20} min / session
-												{/if}
-											</span>
+											{#if shortDate(step.due_date)}
+												<p class="ms-due muted small">🗓 by {shortDate(step.due_date)}</p>
+											{/if}
+											{#if step.status === 'done'}
+												<span class="chip-status completed">Completed</span>
+											{:else if step.effort}
+												<span class="chip-status">{step.effort}</span>
+											{/if}
 										</div>
 									</li>
 								{/each}
@@ -632,6 +633,9 @@
 	.ms-body p {
 		margin: 0 0 8px;
 		font-size: 14px;
+	}
+	.ms-due {
+		margin: 0 0 8px;
 	}
 	.chip-status {
 		display: inline-block;

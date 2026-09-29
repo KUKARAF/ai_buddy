@@ -57,6 +57,7 @@ pub struct StepView {
     pub title: String,
     pub detail: Option<String>,
     pub due_date: Option<String>,
+    pub effort: Option<String>,
     pub status: String,
     pub created_at: String,
 }
@@ -131,12 +132,14 @@ struct StepDraft {
     detail: Option<String>,
     #[serde(default)]
     due_date: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 /// A complete goal + milestone plan, as produced by the agentic coach's
 /// `save_goal` tool call. Deserialized straight from the model's tool arguments
 /// (then sanitized by the caller before it reaches [`create_goal_with_milestones`]).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewGoalWithPlan {
     pub title: String,
     #[serde(default)]
@@ -160,13 +163,15 @@ pub struct NewGoalWithPlan {
 }
 
 /// One milestone within a [`NewGoalWithPlan`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewMilestone {
     pub title: String,
     #[serde(default)]
     pub detail: Option<String>,
     #[serde(default)]
     pub due_date: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 // --- Router -------------------------------------------------------------------
@@ -415,7 +420,7 @@ async fn fetch_roadmap(pool: &SqlitePool, goal_id: &str) -> AppResult<Option<Roa
     };
 
     let steps = sqlx::query_as::<_, StepView>(
-        "SELECT id, roadmap_id, ord, title, detail, due_date, status, created_at \
+        "SELECT id, roadmap_id, ord, title, detail, due_date, effort, status, created_at \
          FROM roadmap_steps WHERE roadmap_id = ? ORDER BY ord ASC, created_at ASC",
     )
     .bind(&id)
@@ -469,7 +474,7 @@ async fn set_step_status(
         .map_err(|e| AppError::Internal(e.into()))?;
 
     sqlx::query_as::<_, StepView>(
-        "SELECT id, roadmap_id, ord, title, detail, due_date, status, created_at \
+        "SELECT id, roadmap_id, ord, title, detail, due_date, effort, status, created_at \
          FROM roadmap_steps WHERE id = ?",
     )
     .bind(step_id)
@@ -485,9 +490,12 @@ const ROADMAP_SYSTEM_PROMPT: &str = "You are an accountability coach and expert 
 Given a user's goal, design a concrete, realistic, motivating step-by-step roadmap of between \
 3 and 8 steps that build toward the goal by its deadline. Each step must be a small, \
 actionable milestone. Respond ONLY with a single JSON object of the exact form: \
-{\"steps\":[{\"title\":\"...\",\"detail\":\"...\" or null,\"due_date\":\"YYYY-MM-DD\" or null}]}. \
-Order steps chronologically and space their due dates sensibly before the goal's deadline. \
-Do not include any prose outside the JSON object.";
+{\"steps\":[{\"title\":\"...\",\"detail\":\"...\" or null,\"due_date\":\"YYYY-MM-DD\" or null,\"effort\":\"...\" or null}]}. \
+Give EACH step its OWN realistic per-step effort (e.g. '4-5 h ride', '3 x 45 min interval sessions', \
+'20 min/day') — never one goal-wide number repeated across steps. Order steps chronologically and \
+space their due dates sensibly before the goal's deadline. For endurance or skill goals, apply \
+sound planning: progressively increase the key stressor, include a recovery/rest cadence, and taper \
+before the event. Do not include any prose outside the JSON object.";
 
 fn roadmap_user_prompt(goal: &GoalView) -> String {
     let mut out = format!("Goal: {}\n", goal.title);
@@ -576,11 +584,17 @@ async fn persist_roadmap(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(to_rfc3339_due);
+        let effort = step
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         sqlx::query(
             "INSERT INTO roadmap_steps \
-                 (id, roadmap_id, ord, title, detail, due_date, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (id, roadmap_id, ord, title, detail, due_date, effort, status, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&step_id)
         .bind(&roadmap_id)
@@ -588,6 +602,7 @@ async fn persist_roadmap(
         .bind(&step.title)
         .bind(&step.detail)
         .bind(&due)
+        .bind(&effort)
         .bind(StepStatus::Pending.as_str())
         .bind(&now)
         .execute(&state.db)
@@ -671,6 +686,7 @@ pub async fn create_goal_with_milestones(
                     title: m.title.clone(),
                     detail: m.detail.clone(),
                     due_date: m.due_date.clone(),
+                    effort: m.effort.clone(),
                 })
                 .collect(),
         };
@@ -1128,5 +1144,44 @@ mod tests {
             .expect("present");
         let ords: Vec<i64> = roadmap.steps.iter().map(|s| s.ord).collect();
         assert_eq!(ords, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn fetch_roadmap_returns_per_step_effort() {
+        let (_dir, pool) = test_pool().await;
+        let goal = insert_goal(
+            &pool, "u1", "Goal", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
+
+        let now = now_rfc3339().expect("now");
+        sqlx::query(
+            "INSERT INTO roadmaps (id, goal_id, model, created_at) VALUES ('rm', ?, 'm', ?)",
+        )
+        .bind(&goal.id)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("roadmap");
+        // Migration 0011 adds the `effort` column; confirm it round-trips.
+        sqlx::query(
+            "INSERT INTO roadmap_steps \
+                 (id, roadmap_id, ord, title, detail, due_date, effort, status, created_at) \
+             VALUES ('s1', 'rm', 0, 'Long ride', NULL, NULL, '4-5 h ride', 'pending', ?)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("step");
+
+        let roadmap = fetch_roadmap(&pool, &goal.id)
+            .await
+            .expect("fetch")
+            .expect("present");
+        assert_eq!(
+            roadmap.steps.first().and_then(|s| s.effort.as_deref()),
+            Some("4-5 h ride")
+        );
     }
 }

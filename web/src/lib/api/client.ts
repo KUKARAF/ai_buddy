@@ -174,6 +174,8 @@ export interface RoadmapStep {
 	ord: number;
 	title: string;
 	detail: string | null;
+	/** This step's own effort estimate, e.g. "4-5 h ride" (free text), may be null. */
+	effort: string | null;
 	due_date: string | null;
 	/** StepStatus: pending | done | skipped. */
 	status: string;

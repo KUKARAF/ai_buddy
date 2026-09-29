@@ -45,16 +45,25 @@ commitment. Keep replies concise, specific, and encouraging.";
 /// The agentic coach persona for the tool-calling `/agent` turn. The concrete
 /// date is injected at call time (see [`agent_system_prompt`]).
 const AGENT_SYSTEM_PROMPT_BODY: &str = "You are AI Buddy, a warm, concise accountability coach. \
-Help the user turn a rambling intention into ONE concrete goal with a realistic deadline and a \
-motivating plan of 3 to 6 milestones. INFER as much as you can from what the user says rather \
-than interrogating them: turn vague timing like \"next spring\" into a concrete YYYY-MM-DD date \
-using today's date, and infer the location, starting skill level, category, and effort per \
-session where you reasonably can. Only ASK about something you genuinely cannot infer, and ask \
-at most one short question at a time. When you have a clear picture, PROPOSE the goal and its 3 \
-to 6 milestones in prose (optionally a small symbolic euro pledge too) and ask the user to \
-confirm. Call the save_goal tool ONLY AFTER the user has explicitly confirmed the proposed goal \
-and plan in the conversation — never before. After saving, briefly celebrate and tell the user \
-their plan is ready. Keep every reply short and encouraging.";
+Turn the user's rambling intention into ONE concrete goal with a realistic deadline and a \
+motivating plan of 3 to 6 chronological milestones building toward it. INFER as much as you can \
+from what the user says rather than interrogating them: turn vague timing like \"next spring\" \
+into a concrete YYYY-MM-DD date using today's date, and infer the location, category, and success \
+criterion where you reasonably can. For training, skill, or endurance goals, ask at most 1 to 2 \
+high-value clarifying questions ONLY when you genuinely cannot infer them (e.g. their current \
+baseline/fitness, or how many hours per week they have) rather than guessing; otherwise do not \
+interrogate. Give EACH milestone its OWN realistic effort (e.g. '4-5 h ride', '3 x 45 min \
+interval sessions', '20 min/day') — never one goal-wide number repeated across every milestone — \
+and its OWN due_date, spanning today through the deadline, chronologically spaced, with the last \
+milestone at or just before the deadline. For endurance or skill goals, apply sound planning \
+principles where relevant: progressive overload (gradually increase the key stressor over the \
+milestones), a recovery/rest cadence, and a TAPER before the event; and for a MULTI-DAY event, \
+include an explicit back-to-back rehearsal milestone (e.g. two long days in a row). Keep this \
+guidance goal-agnostic — for a simple goal, skip the training-specific structure. When you have a \
+clear picture, PROPOSE the goal and its milestones in prose (optionally a small symbolic euro \
+pledge too) and ask the user to confirm. Call the save_goal tool ONLY AFTER the user has \
+explicitly confirmed the proposed goal and plan in the conversation — never before. After saving, \
+briefly celebrate and tell the user their plan is ready. Keep every reply short and encouraging.";
 
 /// The categories the agent may assign to a goal. Anything else is clamped to
 /// `Other` during sanitization.
@@ -191,8 +200,80 @@ fn sanitize_new_goal(mut draft: crate::goals::NewGoalWithPlan) -> crate::goals::
                 milestone.due_date = None;
             }
         }
+        milestone.effort = milestone
+            .effort
+            .take()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty());
     }
     draft
+}
+
+/// System prompt for the plan-then-critique pass (P5). The current draft is
+/// supplied as JSON in the user message; the model returns corrected JSON of the
+/// same shape.
+const CRITIQUE_SYSTEM_PROMPT: &str = "You are an expert planning critic. You return ONLY a single \
+JSON object, no prose.";
+
+/// Build the critique user message: instruct the model to fix implausible
+/// milestone efforts/dates and return corrected JSON of the same shape.
+fn critique_prompt(today: &str, deadline: &str, draft_json: &str) -> String {
+    format!(
+        "Review this training/goal plan for REALISM. Fix any milestone whose effort or date is \
+implausible or contradicts the goal (e.g. a 100 km ride marked '90 min'). Ensure every milestone \
+has a realistic per-milestone effort and a due_date between {today} and {deadline}, chronologically \
+ordered. Return corrected JSON of the EXACT shape \
+{{\"title\":...,\"description\":...,\"deadline\":\"YYYY-MM-DD\",\"category\":...,\"location\":...,\
+\"skill_level\":...,\"time_per_session_min\":...,\"success_criterion\":...,\
+\"milestones\":[{{\"title\":...,\"detail\":...,\"due_date\":\"YYYY-MM-DD\",\"effort\":...}}],\
+\"pledge_cents\":...}}. Here is the current draft:\n{draft_json}"
+    )
+}
+
+/// P5 — one bounded critique/refinement pass over a parsed+sanitized plan before
+/// persisting. Makes a single `chat_json` call; on success the corrected plan is
+/// sanitized and returned along with the call's cost. On ANY error (serialize,
+/// network, parse) it falls back to the original plan with zero added cost — the
+/// request never fails because of the critique.
+async fn refine_plan(
+    state: &AppState,
+    model: &str,
+    today: &str,
+    original: crate::goals::NewGoalWithPlan,
+) -> (crate::goals::NewGoalWithPlan, i64) {
+    let draft_json = match serde_json::to_string(&original) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(error = ?e, "refine_plan: serializing draft failed; using original");
+            return (original, 0);
+        }
+    };
+    let deadline = original
+        .deadline
+        .clone()
+        .unwrap_or_else(|| "the deadline".to_string());
+    let user_prompt = critique_prompt(today, &deadline, &draft_json);
+
+    match state
+        .llm
+        .chat_json::<crate::goals::NewGoalWithPlan>(model, CRITIQUE_SYSTEM_PROMPT, &user_prompt)
+        .await
+    {
+        Ok((refined, cost)) => {
+            let refined = sanitize_new_goal(refined);
+            // Guard against a degenerate refinement that dropped all milestones.
+            if refined.title.trim().is_empty() || refined.milestones.is_empty() {
+                tracing::warn!("refine_plan: refinement was degenerate; using original");
+                (original, cost)
+            } else {
+                (refined, cost)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "refine_plan: critique call failed; using original");
+            (original, 0)
+        }
+    }
 }
 
 /// The single `save_goal` tool exposed to the agent, as an OpenAI `tools` array.
@@ -226,7 +307,8 @@ fn save_goal_tools() -> serde_json::Value {
                             "properties": {
                                 "title": { "type": "string", "description": "Short milestone title." },
                                 "detail": { "type": "string", "description": "Optional milestone detail." },
-                                "due_date": { "type": "string", "description": "Optional milestone due date as YYYY-MM-DD." }
+                                "due_date": { "type": "string", "description": "A realistic target date for THIS milestone, YYYY-MM-DD, between today and the goal deadline." },
+                                "effort": { "type": "string", "description": "Realistic effort for THIS specific milestone, e.g. '4-5 h ride', '3 x 45 min interval sessions', '20 min/day'. NOT a single goal-wide number." }
                             },
                             "required": ["title"]
                         }
@@ -659,6 +741,9 @@ async fn agent_turn(
                 match serde_json::from_str::<crate::goals::NewGoalWithPlan>(&tc.arguments) {
                     Ok(draft) => {
                         let draft = sanitize_new_goal(draft);
+                        // P5: one bounded critique/refinement pass before persisting.
+                        let (draft, refine_cost) = refine_plan(&state, &model, &today, draft).await;
+                        total_cost = total_cost.saturating_add(refine_cost);
                         match crate::goals::create_goal_with_milestones(&state, &user_id, draft)
                             .await
                         {
@@ -762,11 +847,13 @@ mod tests {
                     title: "Book lessons".to_string(),
                     detail: None,
                     due_date: Some("2026-10-01".to_string()),
+                    effort: Some("  90 min lesson  ".to_string()),
                 },
                 crate::goals::NewMilestone {
                     title: "Practice".to_string(),
                     detail: None,
                     due_date: Some("not a date".to_string()),
+                    effort: Some("   ".to_string()),
                 },
             ],
             pledge_cents: Some(-5),
@@ -787,6 +874,15 @@ mod tests {
         );
         assert_eq!(
             clean.milestones.get(1).and_then(|m| m.due_date.as_deref()),
+            None
+        );
+        // Effort is trimmed; whitespace-only effort becomes None.
+        assert_eq!(
+            clean.milestones.first().and_then(|m| m.effort.as_deref()),
+            Some("90 min lesson")
+        );
+        assert_eq!(
+            clean.milestones.get(1).and_then(|m| m.effort.as_deref()),
             None
         );
     }
