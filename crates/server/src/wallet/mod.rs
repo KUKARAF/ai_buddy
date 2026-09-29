@@ -81,7 +81,11 @@ impl PaymentProvider {
         Self(backend)
     }
 
-    pub async fn create_topup(&self, user_id: &str, amount_cents: i64) -> anyhow::Result<TopupSession> {
+    pub async fn create_topup(
+        &self,
+        user_id: &str,
+        amount_cents: i64,
+    ) -> anyhow::Result<TopupSession> {
         self.0.create_topup(user_id, amount_cents).await
     }
 
@@ -226,15 +230,22 @@ async fn get_ledger(
     RequireAuth(user_id): RequireAuth,
 ) -> AppResult<Json<Vec<LedgerEntryView>>> {
     ensure_wallet(&state.db, &user_id).await?;
-    let rows: Vec<(String, String, i64, Option<String>, Option<String>, Option<String>, String)> =
-        sqlx::query_as(
-            "SELECT id, kind, amount_cents, goal_id, external_ref, memo, created_at \
+    let rows: Vec<(
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, kind, amount_cents, goal_id, external_ref, memo, created_at \
              FROM ledger_entries WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 100",
-        )
-        .bind(&user_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+    )
+    .bind(&user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
 
     let entries = rows
         .into_iter()
@@ -384,9 +395,7 @@ async fn confirm_pledge(
         return Err(AppError::Forbidden);
     }
     if status == ai_buddy_core::domain::PledgeStatus::Held.as_str() {
-        return Err(AppError::Conflict(
-            "pledge is already held".to_string(),
-        ));
+        return Err(AppError::Conflict("pledge is already held".to_string()));
     }
     if status != ai_buddy_core::domain::PledgeStatus::Proposed.as_str() {
         return Err(AppError::Conflict(

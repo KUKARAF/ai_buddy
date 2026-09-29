@@ -92,7 +92,12 @@ pub async fn balance_cents(pool: &SqlitePool, user_id: &str) -> AppResult<i64> {
 /// so this never fails on an empty wallet (the 402 gate is enforced *before*
 /// the LLM call). Both `balance_cents` and `token_spend_cents` move by the
 /// actually-debited amount, and a signed `token_debit` ledger row is appended.
-pub async fn debit_tokens(pool: &SqlitePool, user_id: &str, cents: i64, memo: &str) -> AppResult<()> {
+pub async fn debit_tokens(
+    pool: &SqlitePool,
+    user_id: &str,
+    cents: i64,
+    memo: &str,
+) -> AppResult<()> {
     if cents < 0 {
         return Err(AppError::BadRequest(
             "debit amount must be non-negative".to_string(),
@@ -134,7 +139,7 @@ pub async fn debit_tokens(pool: &SqlitePool, user_id: &str, cents: i64, memo: &s
     .map_err(|e| AppError::Internal(e.into()))?;
 
     insert_ledger(
-        &mut *tx,
+        &mut tx,
         user_id,
         LedgerKind::TokenDebit,
         -debit,
@@ -173,14 +178,13 @@ pub async fn credit_topup(
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
 
-    let already: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM ledger_entries WHERE kind = ? AND external_ref = ?",
-    )
-    .bind(LedgerKind::Topup.as_str())
-    .bind(external_ref)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| AppError::Internal(e.into()))?;
+    let already: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM ledger_entries WHERE kind = ? AND external_ref = ?")
+            .bind(LedgerKind::Topup.as_str())
+            .bind(external_ref)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
     if already.is_some() {
         tx.commit()
             .await
@@ -200,7 +204,7 @@ pub async fn credit_topup(
     .map_err(|e| AppError::Internal(e.into()))?;
 
     insert_ledger(
-        &mut *tx,
+        &mut tx,
         user_id,
         LedgerKind::Topup,
         cents,
@@ -283,7 +287,7 @@ pub async fn pledge_hold(
     .map_err(|e| AppError::Internal(e.into()))?;
 
     insert_ledger(
-        &mut *tx,
+        &mut tx,
         user_id,
         LedgerKind::PledgeHold,
         -amount_cents,
@@ -344,7 +348,7 @@ pub async fn pledge_refund(pool: &SqlitePool, goal_id: &str) -> AppResult<()> {
         .map_err(|e| AppError::Internal(e.into()))?;
 
     insert_ledger(
-        &mut *tx,
+        &mut tx,
         &user_id,
         LedgerKind::PledgeRefund,
         amount,
@@ -397,7 +401,7 @@ pub async fn pledge_forfeit(pool: &SqlitePool, goal_id: &str) -> AppResult<()> {
         .map_err(|e| AppError::Internal(e.into()))?;
 
     insert_ledger(
-        &mut *tx,
+        &mut tx,
         &user_id,
         LedgerKind::PledgeForfeit,
         -amount,
@@ -444,22 +448,30 @@ mod tests {
     #[tokio::test]
     async fn topup_credits_balance() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 1000, "ext-1").await.expect("credit");
+        credit_topup(&pool, "u1", 1000, "ext-1")
+            .await
+            .expect("credit");
         assert_eq!(balance_cents(&pool, "u1").await.expect("balance"), 1000);
     }
 
     #[tokio::test]
     async fn topup_is_idempotent_per_external_ref() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 1000, "ext-1").await.expect("credit 1");
-        credit_topup(&pool, "u1", 1000, "ext-1").await.expect("credit 2");
+        credit_topup(&pool, "u1", 1000, "ext-1")
+            .await
+            .expect("credit 1");
+        credit_topup(&pool, "u1", 1000, "ext-1")
+            .await
+            .expect("credit 2");
         assert_eq!(balance_cents(&pool, "u1").await.expect("balance"), 1000);
     }
 
     #[tokio::test]
     async fn debit_reduces_balance() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 1000, "ext-1").await.expect("credit");
+        credit_topup(&pool, "u1", 1000, "ext-1")
+            .await
+            .expect("credit");
         debit_tokens(&pool, "u1", 300, "chat").await.expect("debit");
         assert_eq!(balance_cents(&pool, "u1").await.expect("balance"), 700);
 
@@ -474,19 +486,25 @@ mod tests {
     #[tokio::test]
     async fn debit_never_goes_below_zero() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 100, "ext-1").await.expect("credit");
+        credit_topup(&pool, "u1", 100, "ext-1")
+            .await
+            .expect("credit");
         // Debit more than the balance: clamps to the available 100.
         debit_tokens(&pool, "u1", 500, "chat").await.expect("debit");
         assert_eq!(balance_cents(&pool, "u1").await.expect("balance"), 0);
         // Further debit on an empty wallet is a harmless no-op.
-        debit_tokens(&pool, "u1", 50, "chat").await.expect("debit empty");
+        debit_tokens(&pool, "u1", 50, "chat")
+            .await
+            .expect("debit empty");
         assert_eq!(balance_cents(&pool, "u1").await.expect("balance"), 0);
     }
 
     #[tokio::test]
     async fn pledge_hold_moves_funds() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 1000, "ext-1").await.expect("credit");
+        credit_topup(&pool, "u1", 1000, "ext-1")
+            .await
+            .expect("credit");
         pledge_hold(&pool, "u1", "goal-1", 400).await.expect("hold");
         assert_eq!(balance_cents(&pool, "u1").await.expect("balance"), 600);
 
@@ -501,7 +519,9 @@ mod tests {
     #[tokio::test]
     async fn pledge_hold_insufficient_balance_errors() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 100, "ext-1").await.expect("credit");
+        credit_topup(&pool, "u1", 100, "ext-1")
+            .await
+            .expect("credit");
         let err = pledge_hold(&pool, "u1", "goal-1", 400)
             .await
             .expect_err("should fail");
@@ -513,7 +533,9 @@ mod tests {
     #[tokio::test]
     async fn pledge_refund_returns_funds() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 1000, "ext-1").await.expect("credit");
+        credit_topup(&pool, "u1", 1000, "ext-1")
+            .await
+            .expect("credit");
         pledge_hold(&pool, "u1", "goal-1", 400).await.expect("hold");
         pledge_refund(&pool, "goal-1").await.expect("refund");
         assert_eq!(balance_cents(&pool, "u1").await.expect("balance"), 1000);
@@ -529,7 +551,9 @@ mod tests {
     #[tokio::test]
     async fn pledge_forfeit_keeps_funds_removed() {
         let (_dir, pool) = test_pool().await;
-        credit_topup(&pool, "u1", 1000, "ext-1").await.expect("credit");
+        credit_topup(&pool, "u1", 1000, "ext-1")
+            .await
+            .expect("credit");
         pledge_hold(&pool, "u1", "goal-1", 400).await.expect("hold");
         pledge_forfeit(&pool, "goal-1").await.expect("forfeit");
         // Funds stay gone (already removed at hold time).

@@ -297,7 +297,9 @@ impl LlmClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Internal(anyhow!("OpenRouter embeddings request failed: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(anyhow!("OpenRouter embeddings request failed: {e}"))
+            })?;
 
         let parsed: EmbedResponse = read_json(resp).await?;
         let embedding = parsed
@@ -311,9 +313,12 @@ impl LlmClient {
         let tokens = parsed
             .usage
             .and_then(|u| u.prompt_tokens.or(u.total_tokens))
-            .unwrap_or_else(|| (text.len() / 4) as u32);
+            .unwrap_or((text.len() / 4) as u32);
 
-        Ok((embedding, embed_cost_cents(&self.inner.embedding_model, tokens)))
+        Ok((
+            embedding,
+            embed_cost_cents(&self.inner.embedding_model, tokens),
+        ))
     }
 }
 
@@ -427,8 +432,8 @@ fn model_rate(model: &str) -> (f64, f64) {
 /// **up**, with a **minimum of 1 cent**.
 fn cost_cents(model: &str, prompt_tokens: u32, completion_tokens: u32) -> i64 {
     let (pr, cr) = model_rate(model);
-    let usd = (prompt_tokens as f64 / 1_000_000.0) * pr
-        + (completion_tokens as f64 / 1_000_000.0) * cr;
+    let usd =
+        (prompt_tokens as f64 / 1_000_000.0) * pr + (completion_tokens as f64 / 1_000_000.0) * cr;
     // Subtract a tiny epsilon before ceil so f64 representation noise (e.g.
     // 5*0.92*100 == 460.0000000000001) doesn't spuriously round a whole cent up.
     let cents = ((usd * USD_TO_EUR * 100.0) - 1e-9).ceil() as i64;
@@ -585,7 +590,10 @@ mod tests {
     fn extract_json_handles_fenced_output() {
         let fenced = "```json\n{\"a\":1}\n```";
         assert_eq!(extract_json(fenced), Some("{\"a\":1}"));
-        assert_eq!(extract_json("prose {\"x\":true} more"), Some("{\"x\":true}"));
+        assert_eq!(
+            extract_json("prose {\"x\":true} more"),
+            Some("{\"x\":true}")
+        );
         assert_eq!(extract_json("no json here"), None);
         assert_eq!(extract_json("} {"), None);
     }

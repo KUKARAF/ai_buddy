@@ -39,8 +39,10 @@ fn encode(v: &[f32]) -> Vec<u8> {
 /// Decode little-endian `f32` bytes back into a vector. Trailing bytes that
 /// don't form a full `f32` are ignored.
 fn decode(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .filter_map(|c| c.try_into().ok().map(f32::from_le_bytes))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -218,18 +220,44 @@ mod tests {
         upsert(&pool, "u1", "goal", "g1", "m", "run a 5k", &[1.0, 0.0, 0.0])
             .await
             .unwrap();
-        upsert(&pool, "u1", "message", "m1", "m", "off topic", &[0.0, 1.0, 0.0])
-            .await
-            .unwrap();
-        upsert(&pool, "u1", "goal", "g2", "m", "jog daily", &[0.9, 0.1, 0.0])
-            .await
-            .unwrap();
+        upsert(
+            &pool,
+            "u1",
+            "message",
+            "m1",
+            "m",
+            "off topic",
+            &[0.0, 1.0, 0.0],
+        )
+        .await
+        .unwrap();
+        upsert(
+            &pool,
+            "u1",
+            "goal",
+            "g2",
+            "m",
+            "jog daily",
+            &[0.9, 0.1, 0.0],
+        )
+        .await
+        .unwrap();
         // Another user's row must never surface.
-        upsert(&pool, "u2", "goal", "gX", "m", "someone else", &[1.0, 0.0, 0.0])
+        upsert(
+            &pool,
+            "u2",
+            "goal",
+            "gX",
+            "m",
+            "someone else",
+            &[1.0, 0.0, 0.0],
+        )
+        .await
+        .unwrap();
+
+        let hits = search(&pool, "u1", &[1.0, 0.0, 0.0], 10, &[])
             .await
             .unwrap();
-
-        let hits = search(&pool, "u1", &[1.0, 0.0, 0.0], 10, &[]).await.unwrap();
         let order: Vec<String> = hits.iter().map(|h| h.source_id.clone()).collect();
         assert_eq!(order, vec!["g1", "g2", "m1"]); // exact, close, orthogonal
 

@@ -73,8 +73,7 @@ impl From<ReminderRow> for NotificationDto {
     fn from(r: ReminderRow) -> Self {
         // Stored payload is JSON TEXT; fall back to `{}` if it is somehow invalid
         // rather than failing the whole listing.
-        let payload =
-            serde_json::from_str(&r.payload).unwrap_or_else(|_| serde_json::json!({}));
+        let payload = serde_json::from_str(&r.payload).unwrap_or_else(|_| serde_json::json!({}));
         NotificationDto {
             id: r.id,
             goal_id: r.goal_id,
@@ -165,6 +164,7 @@ impl Notifier {
     ///
     /// Called by the goals module to seed roadmap reminders — signature is stable.
     /// `payload` is stored as JSON TEXT; `channel` is e.g. `"inapp"`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue(
         &self,
         user_id: &str,
@@ -351,7 +351,15 @@ mod tests {
         let notifier = Notifier::new(pool.clone());
 
         let id = notifier
-            .enqueue("u1", None, None, "tip", PAST, "inapp", serde_json::json!({}))
+            .enqueue(
+                "u1",
+                None,
+                None,
+                "tip",
+                PAST,
+                "inapp",
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
 

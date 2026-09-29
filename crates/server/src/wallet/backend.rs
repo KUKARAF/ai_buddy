@@ -20,7 +20,11 @@ pub struct MockPaymentBackend;
 
 #[async_trait::async_trait]
 impl PaymentBackend for MockPaymentBackend {
-    async fn create_topup(&self, _user_id: &str, _amount_cents: i64) -> anyhow::Result<TopupSession> {
+    async fn create_topup(
+        &self,
+        _user_id: &str,
+        _amount_cents: i64,
+    ) -> anyhow::Result<TopupSession> {
         Ok(TopupSession {
             checkout_url: None,
             external_ref: format!("mock_{}", uuid::Uuid::new_v4()),
@@ -143,7 +147,8 @@ impl PaymentBackend for StripePaymentBackend {
                 }
             }
         }
-        let timestamp = timestamp.ok_or_else(|| anyhow!("missing timestamp in Stripe-Signature"))?;
+        let timestamp =
+            timestamp.ok_or_else(|| anyhow!("missing timestamp in Stripe-Signature"))?;
         let v1 = v1.ok_or_else(|| anyhow!("missing v1 signature in Stripe-Signature"))?;
 
         // signed_payload = timestamp + "." + raw body
@@ -192,7 +197,10 @@ impl PaymentBackend for StripePaymentBackend {
             })
             .unwrap_or_default()
             .to_string();
-        let payment_status = obj.get("payment_status").and_then(|v| v.as_str()).unwrap_or("");
+        let payment_status = obj
+            .get("payment_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         let succeeded = event_type == "checkout.session.completed" && payment_status == "paid";
 
@@ -320,7 +328,10 @@ mod tests {
         signed.extend_from_slice(ts.to_string().as_bytes());
         signed.push(b'.');
         signed.extend_from_slice(body.as_bytes());
-        let sig = format!("t={ts},v1={}", to_hex(&hmac_sha256(secret.as_bytes(), &signed)));
+        let sig = format!(
+            "t={ts},v1={}",
+            to_hex(&hmac_sha256(secret.as_bytes(), &signed))
+        );
 
         let event = backend
             .verify_webhook(&sig, body.as_bytes())
