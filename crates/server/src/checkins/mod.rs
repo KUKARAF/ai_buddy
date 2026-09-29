@@ -28,11 +28,22 @@ use time::{Date, Duration, Month, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::auth::session::RequireAuth;
+use crate::config::Config;
 use crate::error::{AppError, AppResult};
+use crate::llm::LlmClient;
 use crate::state::AppState;
 
 /// Upper bound on rows returned by `GET /api/check-ins`.
 const LIST_LIMIT: i64 = 100;
+
+/// Notes shorter than this (after trimming) are treated as routine and skip the
+/// LLM classification entirely — nothing to reason about, and it keeps the fast
+/// path free of a network round-trip for a bare "done".
+const MIN_CLASSIFY_NOTE_LEN: usize = 6;
+
+/// System prompt for the best-effort check-in note classifier. Asks for a strict
+/// JSON verdict on whether the plan/timeline should be revisited.
+const CLASSIFY_SYSTEM: &str = "You analyze a user's check-in note about a goal. Decide if it implies the plan/timeline should be revisited — e.g. they'll be unavailable for a period (travel, holidays like Christmas, vacation), they're falling behind or ahead, injured/sick, or circumstances changed. Respond ONLY as JSON: {\"adjust\": boolean, \"message\": string}. If adjust is true, message is a SHORT, warm one-sentence offer from the coach to update the plan (e.g. \"Sounds like you'll be away over Christmas — want me to add a break and shift your milestones?\"). If the note is just routine progress with no scheduling impact, return {\"adjust\": false, \"message\": null}. Keep message under 160 characters.";
 
 /// One `check_ins` row as returned to clients.
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -42,6 +53,43 @@ struct CheckIn {
     note: Option<String>,
     mood: Option<String>,
     created_at: String,
+}
+
+/// Coach "offer" attached to a check-in response: whether the plan/timeline
+/// should be revisited, plus a short warm message when so (`null` otherwise).
+#[derive(Debug, Serialize)]
+struct Suggestion {
+    adjust: bool,
+    message: Option<String>,
+}
+
+impl Suggestion {
+    /// The neutral default returned whenever classification is skipped or fails:
+    /// no adjustment, no message. Never fails a check-in.
+    fn none() -> Self {
+        Suggestion {
+            adjust: false,
+            message: None,
+        }
+    }
+}
+
+/// The goal-scoped check-in response: the stored row plus a coach `suggestion`.
+#[derive(Debug, Serialize)]
+struct GoalCheckInResponse {
+    #[serde(flatten)]
+    check_in: CheckIn,
+    suggestion: Suggestion,
+}
+
+/// The model's verdict, parsed from the classifier's JSON output. Fields default
+/// so a partial object still deserializes (best-effort classification).
+#[derive(Debug, Deserialize)]
+struct Classification {
+    #[serde(default)]
+    adjust: bool,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 /// Body of `POST /api/goals/{id}/check-ins`.
@@ -222,17 +270,73 @@ async fn list_goal_checkins(pool: &SqlitePool, goal_id: &str) -> AppResult<Vec<C
     .map_err(|e| AppError::Internal(e.into()))
 }
 
+/// Best-effort classification of a check-in note into a coach [`Suggestion`].
+///
+/// This NEVER fails: on a missing/short note, an unresolved model, a missing LLM
+/// key, a network/parse error, or any other problem it falls back to
+/// [`Suggestion::none`]. The token cost of a successful call is debited best-effort
+/// (only when positive; a debit failure is swallowed). Callers must treat the
+/// check-in itself as the source of truth — the suggestion is purely advisory.
+async fn classify_note(
+    llm: &LlmClient,
+    pool: &SqlitePool,
+    config: &Config,
+    user_id: &str,
+    note: Option<&str>,
+) -> Suggestion {
+    // Nothing meaningful to classify: empty or very short notes are routine.
+    let note = match note.map(str::trim) {
+        Some(n) if n.len() >= MIN_CLASSIFY_NOTE_LEN => n,
+        _ => return Suggestion::none(),
+    };
+
+    let model = match crate::settings::user_chat_model(pool, config, user_id).await {
+        Ok(m) => m,
+        Err(_) => return Suggestion::none(),
+    };
+
+    let (classification, cost_cents) = match llm
+        .chat_json::<Classification>(&model, CLASSIFY_SYSTEM, note)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(_) => return Suggestion::none(),
+    };
+
+    // Charge the wallet best-effort; a debit failure must not fail the check-in.
+    if cost_cents > 0 {
+        let _ = crate::wallet::debit_tokens(pool, user_id, cost_cents, "checkin-classify").await;
+    }
+
+    if classification.adjust {
+        let message = classification
+            .message
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        Suggestion {
+            adjust: true,
+            message,
+        }
+    } else {
+        Suggestion::none()
+    }
+}
+
 /// `POST /api/goals/{id}/check-ins` — check in against a specific goal.
+///
+/// Stores the check-in, then runs a best-effort LLM classification of the note to
+/// attach a coach `suggestion`. Classification never blocks or fails the check-in:
+/// on any error it degrades to `{ adjust: false, message: null }`.
 async fn create_goal_checkin(
     State(state): State<AppState>,
     RequireAuth(user_id): RequireAuth,
     Path(goal_id): Path<String>,
     WithRejection(Json(body), _): WithRejection<Json<GoalCheckInReq>, AppError>,
-) -> AppResult<Json<CheckIn>> {
+) -> AppResult<Json<GoalCheckInResponse>> {
     verify_goal_owner(&state.db, &user_id, &goal_id).await?;
     let note = normalize(body.note);
     let mood = normalize(body.mood);
-    let created = insert_checkin(
+    let check_in = insert_checkin(
         &state.db,
         &user_id,
         Some(&goal_id),
@@ -240,7 +344,20 @@ async fn create_goal_checkin(
         mood.as_deref(),
     )
     .await?;
-    Ok(Json(created))
+
+    let suggestion = classify_note(
+        &state.llm,
+        &state.db,
+        &state.config,
+        &user_id,
+        note.as_deref(),
+    )
+    .await;
+
+    Ok(Json(GoalCheckInResponse {
+        check_in,
+        suggestion,
+    }))
 }
 
 /// `GET /api/goals/{id}/check-ins` — a goal's check-ins, newest first.
@@ -488,6 +605,51 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn checkin_stored_and_suggestion_defaults_when_classification_errors() {
+        let (_dir, pool) = test_pool().await;
+        insert_goal(&pool, "g1", "u1").await;
+
+        // Mirror the handler: store the check-in, then classify best-effort.
+        let note = "Heads up — I'll be away over Christmas for two weeks";
+        let created = insert_checkin(&pool, "u1", Some("g1"), Some(note), None)
+            .await
+            .expect("insert checkin");
+
+        // The check-in row is persisted regardless of classification.
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM check_ins WHERE id = ?")
+            .bind(&created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+
+        // Tests have no LLM key configured, so `chat_json` errors and the
+        // classifier falls back to the neutral suggestion — never a failure.
+        let config = Config::from_env();
+        let llm = LlmClient::new(&config);
+        let suggestion = classify_note(&llm, &pool, &config, "u1", Some(note)).await;
+        assert!(
+            !suggestion.adjust,
+            "classification error falls back to false"
+        );
+        assert!(suggestion.message.is_none());
+    }
+
+    #[tokio::test]
+    async fn short_or_empty_note_skips_classification() {
+        let (_dir, pool) = test_pool().await;
+        let config = Config::from_env();
+        let llm = LlmClient::new(&config);
+
+        // Empty / absent / trivially short notes never reach the LLM.
+        for note in [None, Some(""), Some("  "), Some("ok")] {
+            let suggestion = classify_note(&llm, &pool, &config, "u1", note).await;
+            assert!(!suggestion.adjust);
+            assert!(suggestion.message.is_none());
+        }
     }
 
     #[tokio::test]

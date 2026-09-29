@@ -182,12 +182,27 @@ export interface RoadmapStep {
 	created_at: string;
 }
 
+/**
+ * A planned away-period on the roadmap (e.g. Christmas, a holiday) that the
+ * timeline renders as a distinct "break" block between milestones.
+ */
+export interface Break {
+	id: string;
+	label: string;
+	/** YYYY-MM-DD. */
+	start_date: string;
+	/** YYYY-MM-DD. */
+	end_date: string;
+}
+
 export interface Roadmap {
 	id: string;
 	goal_id: string;
 	model: string | null;
 	created_at: string;
 	steps: RoadmapStep[];
+	/** Planned breaks (Christmas, vacations, …); empty when there are none. */
+	breaks: Break[];
 }
 
 export interface Notification {
@@ -421,16 +436,47 @@ export function patchStep(
 
 // --- Check-ins ----------------------------------------------------------------
 
+/**
+ * The response from logging a goal check-in. It is a {@link CheckIn} plus a
+ * coach `suggestion`: when `adjust` is true the coach is offering to tweak the
+ * plan (with a `message` to show), otherwise it's a plain recorded check-in.
+ */
+export interface GoalCheckInResponse extends CheckIn {
+	suggestion: { adjust: boolean; message: string | null };
+}
+
 /** POST /api/goals/:id/check-ins — log a check-in against a goal. */
 export function createGoalCheckIn(
 	goalId: string,
 	input: { note?: string; mood?: string },
 	options?: RequestOptions
-): Promise<CheckIn> {
-	return request<CheckIn>(
+): Promise<GoalCheckInResponse> {
+	return request<GoalCheckInResponse>(
 		'POST',
 		`/api/goals/${encodeURIComponent(goalId)}/check-ins`,
 		input,
+		options
+	);
+}
+
+/**
+ * POST /api/goals/:id/adjust — one agentic, NON-streaming coach turn that can
+ * change the plan's timeline/breaks (propose-then-confirm). The turn may take a
+ * few seconds; `changed` is true only when the coach actually altered the plan,
+ * in which case callers should re-fetch the roadmap.
+ *
+ * Can throw {@link ApiError} with `.status === 402` (wallet empty) or
+ * `.status === 400` (coach unavailable); callers surface those gently.
+ */
+export function adjustPlan(
+	goalId: string,
+	content: string,
+	options?: RequestOptions
+): Promise<{ reply: string; changed: boolean }> {
+	return request<{ reply: string; changed: boolean }>(
+		'POST',
+		`/api/goals/${encodeURIComponent(goalId)}/adjust`,
+		{ content },
 		options
 	);
 }

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import { goto } from '$app/navigation';
@@ -15,6 +15,7 @@
 		patchStep,
 		patchGoal,
 		createGoalCheckIn,
+		adjustPlan,
 		createPledge,
 		confirmPledge,
 		getWallet,
@@ -23,6 +24,7 @@
 		type Goal,
 		type Roadmap,
 		type RoadmapStep,
+		type Break,
 		type CheckIn,
 		type Pledge,
 		type SimilarGoals
@@ -50,6 +52,25 @@
 	let composerOpen = $state(false);
 	let note = $state('');
 	let checkinSubmitting = $state(false);
+
+	// Coach's post-check-in "want me to adjust your plan?" offer. Only shown when
+	// the backend actually offers it (suggestion.adjust === true).
+	let offer = $state<{ message: string; note: string } | null>(null);
+
+	// "Adjust my plan" mini-chat (agentic, non-streaming coach turn).
+	interface AdjustMessage {
+		id: string;
+		role: 'user' | 'assistant';
+		content: string;
+	}
+	let adjustOpen = $state(false);
+	let adjustMessages = $state<AdjustMessage[]>([]);
+	let adjustDraft = $state('');
+	let adjustSending = $state(false);
+	let adjustError = $state<string | null>(null);
+	let adjustNeedsTopup = $state(false);
+	let adjustUnavailable = $state(false);
+	let adjustThread = $state<HTMLElement | null>(null);
 
 	// pledge form
 	let pledgeAmount = $state('4');
@@ -94,6 +115,34 @@
 	const pct = $derived(steps.length > 0 ? Math.round((doneCount / steps.length) * 100) : 0);
 	const allDone = $derived(steps.length > 0 && doneCount === steps.length);
 
+	// Milestones + planned breaks, merged into one chronological timeline. When
+	// there are no breaks this is exactly the milestone list (same look as before).
+	// Milestone numbers stay tied to the milestone's own order, not merged index.
+	type TimelineItem =
+		| { kind: 'step'; step: RoadmapStep; num: number; date: string | null }
+		| { kind: 'break'; brk: Break; date: string };
+
+	const timeline = $derived.by<TimelineItem[]>(() => {
+		const items: TimelineItem[] = steps.map((step, i) => ({
+			kind: 'step',
+			step,
+			num: i + 1,
+			date: step.due_date
+		}));
+		const breaks = [...(roadmap?.breaks ?? [])].sort((a, b) =>
+			a.start_date < b.start_date ? -1 : a.start_date > b.start_date ? 1 : 0
+		);
+		if (breaks.length === 0) return items;
+		const merged: TimelineItem[] = [...items];
+		for (const brk of breaks) {
+			// Slot the break before the first later-dated milestone; otherwise last.
+			let idx = merged.findIndex((m) => m.date !== null && m.date > brk.start_date);
+			if (idx === -1) idx = merged.length;
+			merged.splice(idx, 0, { kind: 'break', brk, date: brk.start_date });
+		}
+		return merged;
+	});
+
 	const metaBits = $derived.by(() => {
 		if (!goal) return [];
 		const bits: string[] = [];
@@ -132,11 +181,89 @@
 			note = '';
 			composerOpen = false;
 			void app.refreshStreak();
+			// Only surface the coach's offer when it genuinely wants to adjust — never fabricate one.
+			if (ci.suggestion?.adjust) {
+				offer = {
+					message: ci.suggestion.message ?? 'Want me to adjust your plan?',
+					note: text
+				};
+			}
 		} catch {
 			/* ignore; keep the text so the user can retry */
 		} finally {
 			checkinSubmitting = false;
 		}
+	}
+
+	async function scrollAdjust(): Promise<void> {
+		await tick();
+		if (adjustThread) adjustThread.scrollTop = adjustThread.scrollHeight;
+	}
+
+	async function sendAdjust(content: string): Promise<void> {
+		if (content === '' || adjustSending) return;
+		adjustError = null;
+		adjustNeedsTopup = false;
+		adjustUnavailable = false;
+		adjustSending = true;
+		adjustMessages = [...adjustMessages, { id: `u-${Date.now()}`, role: 'user', content }];
+		void scrollAdjust();
+		try {
+			const res = await adjustPlan(goalId, content);
+			adjustMessages = [
+				...adjustMessages,
+				{ id: `a-${Date.now()}`, role: 'assistant', content: res.reply }
+			];
+			// The coach changed the plan/breaks — refresh so new milestones/dates/breaks render now.
+			if (res.changed) {
+				void getRoadmap(goalId)
+					.then((r) => (roadmap = r))
+					.catch(() => {});
+				void listGoalCheckIns(goalId)
+					.then((c) => (checkIns = c))
+					.catch(() => {});
+			}
+		} catch (err) {
+			if (err instanceof ApiError && err.status === 402) {
+				adjustNeedsTopup = true;
+			} else if (err instanceof ApiError && err.status === 400) {
+				adjustUnavailable = true;
+			} else {
+				adjustError = err instanceof ApiError ? err.message : 'Failed to reach your coach.';
+			}
+		} finally {
+			adjustSending = false;
+			void scrollAdjust();
+		}
+	}
+
+	async function openAdjust(seed?: string): Promise<void> {
+		adjustOpen = true;
+		adjustError = null;
+		adjustNeedsTopup = false;
+		adjustUnavailable = false;
+		// Seed the conversation once with the just-made check-in note.
+		if (adjustMessages.length === 0 && seed !== undefined && seed.trim() !== '') {
+			await sendAdjust(seed.trim());
+		}
+	}
+
+	function acceptOffer(): void {
+		const seed = offer?.note;
+		offer = null;
+		void openAdjust(seed);
+	}
+
+	function submitAdjust(e: SubmitEvent): void {
+		e.preventDefault();
+		const content = adjustDraft.trim();
+		if (content === '' || adjustSending) return;
+		adjustDraft = '';
+		void sendAdjust(content);
+	}
+
+	function closeAdjust(): void {
+		adjustOpen = false;
 	}
 
 	async function submitPledge(e: SubmitEvent): Promise<void> {
@@ -278,8 +405,19 @@
 			<div class="col">
 				{#if tab === 'plan'}
 					<section>
-						<h2>Small steps. Real progress.</h2>
-						<p class="muted sub">A starter framework you control — tap a step to mark it done.</p>
+						<div class="plan-head">
+							<div>
+								<h2>Small steps. Real progress.</h2>
+								<p class="muted sub">
+									A starter framework you control — tap a step to mark it done.
+								</p>
+							</div>
+							{#if steps.length > 0}
+								<button class="btn btn-ghost adjust-open" onclick={() => openAdjust()}>
+									<Icon name="sparkle" size={15} /> Adjust my plan
+								</button>
+							{/if}
+						</div>
 
 						{#if steps.length === 0}
 							<div class="card empty-plan">
@@ -288,33 +426,49 @@
 							</div>
 						{:else}
 							<ol class="timeline">
-								{#each steps as step, i (step.id)}
-									<li class:done={step.status === 'done'}>
-										<button
-											class="node"
-											aria-label={step.status === 'done' ? 'Mark step not done' : 'Mark step done'}
-											onclick={() => toggleStep(step)}
-										>
-											{#if step.status === 'done'}
-												<Icon name="check" size={15} stroke={2.6} />
-											{:else}
-												{String(i + 1).padStart(2, '0')}
-											{/if}
-										</button>
-										<div class="ms-body">
-											<p class="eyebrow">Milestone {i + 1}</p>
-											<h3>{step.title}</h3>
-											{#if step.detail}<p class="muted">{step.detail}</p>{/if}
-											{#if shortDate(step.due_date)}
-												<p class="ms-due muted small">🗓 by {shortDate(step.due_date)}</p>
-											{/if}
-											{#if step.status === 'done'}
-												<span class="chip-status completed">Completed</span>
-											{:else if step.effort}
-												<span class="chip-status">{step.effort}</span>
-											{/if}
-										</div>
-									</li>
+								{#each timeline as item (item.kind === 'step' ? item.step.id : `brk-${item.brk.id}`)}
+									{#if item.kind === 'step'}
+										<li class:done={item.step.status === 'done'}>
+											<button
+												class="node"
+												aria-label={item.step.status === 'done'
+													? 'Mark step not done'
+													: 'Mark step done'}
+												onclick={() => toggleStep(item.step)}
+											>
+												{#if item.step.status === 'done'}
+													<Icon name="check" size={15} stroke={2.6} />
+												{:else}
+													{String(item.num).padStart(2, '0')}
+												{/if}
+											</button>
+											<div class="ms-body">
+												<p class="eyebrow">Milestone {item.num}</p>
+												<h3>{item.step.title}</h3>
+												{#if item.step.detail}<p class="muted">{item.step.detail}</p>{/if}
+												{#if shortDate(item.step.due_date)}
+													<p class="ms-due muted small">🗓 by {shortDate(item.step.due_date)}</p>
+												{/if}
+												{#if item.step.status === 'done'}
+													<span class="chip-status completed">Completed</span>
+												{:else if item.step.effort}
+													<span class="chip-status">{item.step.effort}</span>
+												{/if}
+											</div>
+										</li>
+									{:else}
+										<li class="brk">
+											<span class="brk-node" aria-hidden="true">🌴</span>
+											<div class="brk-card">
+												<p class="brk-text">
+													🌴 {item.brk.label} · {shortDate(item.brk.start_date)}–{shortDate(
+														item.brk.end_date
+													)}
+												</p>
+												<span class="brk-tag">planned break</span>
+											</div>
+										</li>
+									{/if}
 								{/each}
 							</ol>
 
@@ -364,6 +518,23 @@
 									</button>
 								</div>
 							</form>
+						{/if}
+
+						{#if offer}
+							<div class="card offer">
+								<span class="offer-av"><Icon name="check" size={14} stroke={2.6} /></span>
+								<div class="offer-body">
+									<p class="offer-msg">{offer.message}</p>
+									<div class="offer-actions">
+										<button class="btn btn-lime offer-yes" onclick={acceptOffer}>
+											<Icon name="sparkle" size={15} /> Adjust my plan
+										</button>
+										<button class="btn btn-ghost offer-no" onclick={() => (offer = null)}>
+											Not now
+										</button>
+									</div>
+								</div>
+							</div>
 						{/if}
 
 						{#if checkIns.length === 0}
@@ -464,6 +635,92 @@
 				</section>
 			</aside>
 		</div>
+
+		{#if adjustOpen}
+			<div
+				class="adjust-backdrop"
+				role="button"
+				tabindex="-1"
+				aria-label="Close"
+				onclick={closeAdjust}
+				onkeydown={(e) => e.key === 'Escape' && closeAdjust()}
+			></div>
+			<div class="adjust-modal card" role="dialog" aria-modal="true" aria-label="Adjust my plan">
+				<header class="adjust-head">
+					<span class="adjust-badge"><Icon name="sparkle" size={16} /></span>
+					<div class="adjust-title">
+						<h2>Adjust my plan</h2>
+						<p class="muted small">Tell your coach what changed — it'll reshape your timeline.</p>
+					</div>
+					<button class="adjust-close" aria-label="Close" onclick={closeAdjust}>
+						<Icon name="x" size={18} />
+					</button>
+				</header>
+
+				<section class="adjust-thread" aria-live="polite" bind:this={adjustThread}>
+					{#if adjustMessages.length === 0}
+						<div class="row assistant">
+							<span class="av"><Icon name="check" size={14} stroke={2.6} /></span>
+							<div class="bubble a-bubble">
+								What would you like to change? For example: "I'll be away over Christmas — add the
+								break and shift everything after it."
+							</div>
+						</div>
+					{/if}
+					{#each adjustMessages as message (message.id)}
+						{#if message.role === 'assistant'}
+							<div class="row assistant">
+								<span class="av"><Icon name="check" size={14} stroke={2.6} /></span>
+								<div class="bubble a-bubble">{message.content}</div>
+							</div>
+						{:else}
+							<div class="row user">
+								<div class="bubble u-bubble">{message.content}</div>
+							</div>
+						{/if}
+					{/each}
+
+					{#if adjustSending && adjustMessages[adjustMessages.length - 1]?.role === 'user'}
+						<div class="row assistant">
+							<span class="av"><Icon name="check" size={14} stroke={2.6} /></span>
+							<div class="bubble a-bubble muted">Your coach is thinking…</div>
+						</div>
+					{/if}
+				</section>
+
+				{#if adjustNeedsTopup}
+					<div class="notice">
+						<Icon name="wallet" size={18} />
+						<span>Your wallet's empty — add a little to keep talking with your coach.</span>
+						<a class="btn btn-lime" href={resolve('/wallet')}>Open wallet</a>
+					</div>
+				{/if}
+				{#if adjustUnavailable}
+					<div class="notice">
+						<Icon name="sparkle" size={18} />
+						<span>Your coach isn't available right now. Please try again a little later.</span>
+					</div>
+				{/if}
+				{#if adjustError}<p class="error small">{adjustError}</p>{/if}
+
+				<form class="adjust-form" onsubmit={submitAdjust}>
+					<input
+						type="text"
+						placeholder="Message your coach…"
+						bind:value={adjustDraft}
+						disabled={adjustSending}
+					/>
+					<button
+						type="submit"
+						class="sendbtn"
+						disabled={adjustSending || adjustDraft.trim() === ''}
+						aria-label="Send"
+					>
+						<Icon name="send" size={18} />
+					</button>
+				</form>
+			</div>
+		{/if}
 	{/if}
 </div>
 
@@ -826,6 +1083,253 @@
 	.error {
 		color: #c0263a;
 		font-size: 14px;
+	}
+
+	/* plan header row with the "Adjust my plan" entry point */
+	.plan-head {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.adjust-open {
+		flex: none;
+		padding: 8px 12px;
+		font-size: 13px;
+	}
+
+	/* planned break block in the timeline — visually distinct "away" card */
+	.timeline li.brk {
+		align-items: center;
+	}
+	.brk-node {
+		width: 36px;
+		height: 36px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--sage) 55%, var(--card));
+		border: 2px dashed var(--sage-ink);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 15px;
+		flex: none;
+		z-index: 1;
+	}
+	.brk-card {
+		flex: 1;
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 12px;
+		background: color-mix(in srgb, var(--sage) 22%, var(--card));
+		border: 1px dashed var(--sage-ink);
+		border-radius: 12px;
+		padding: 12px 14px;
+	}
+	.brk-text {
+		margin: 0;
+		font-size: 14px;
+		font-weight: 600;
+		color: var(--ink);
+	}
+	.brk-tag {
+		display: inline-block;
+		background: color-mix(in srgb, var(--sage) 45%, var(--card));
+		color: var(--sage-ink);
+		border-radius: 999px;
+		padding: 3px 10px;
+		font-size: 12px;
+		font-weight: 600;
+	}
+
+	/* post-check-in coach offer */
+	.offer {
+		display: flex;
+		gap: 12px;
+		padding: 14px;
+		margin-bottom: 14px;
+		background: color-mix(in srgb, var(--lime) 18%, var(--card));
+	}
+	.offer-av {
+		width: 28px;
+		height: 28px;
+		border-radius: 999px;
+		background: var(--lime);
+		color: var(--ink);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: none;
+	}
+	.offer-body {
+		flex: 1;
+		min-width: 0;
+	}
+	.offer-msg {
+		margin: 2px 0 12px;
+		font-size: 14px;
+	}
+	.offer-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+	}
+	.offer-yes,
+	.offer-no {
+		padding: 8px 12px;
+		font-size: 13px;
+	}
+
+	/* adjust mini-chat modal */
+	.adjust-backdrop {
+		position: fixed;
+		inset: 0;
+		background: rgba(20, 40, 45, 0.32);
+		z-index: 40;
+	}
+	.adjust-modal {
+		position: fixed;
+		z-index: 41;
+		left: 50%;
+		bottom: 0;
+		transform: translateX(-50%);
+		width: min(560px, 100%);
+		max-height: min(80vh, 640px);
+		display: flex;
+		flex-direction: column;
+		gap: 14px;
+		padding: 18px;
+		border-radius: 18px 18px 0 0;
+	}
+	.adjust-head {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+	}
+	.adjust-badge {
+		width: 36px;
+		height: 36px;
+		border-radius: 12px;
+		background: var(--teal);
+		color: var(--lime);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: none;
+	}
+	.adjust-title {
+		flex: 1;
+		min-width: 0;
+	}
+	.adjust-title h2 {
+		font-size: 18px;
+	}
+	.adjust-title p {
+		margin: 2px 0 0;
+	}
+	.adjust-close {
+		background: transparent;
+		border: none;
+		color: var(--muted);
+		flex: none;
+		padding: 4px;
+	}
+	.adjust-thread {
+		flex: 1;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		padding: 2px;
+	}
+	.row {
+		display: flex;
+		gap: 10px;
+		align-items: flex-end;
+	}
+	.row.user {
+		justify-content: flex-end;
+	}
+	.av {
+		width: 28px;
+		height: 28px;
+		border-radius: 999px;
+		background: var(--lime);
+		color: var(--ink);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: none;
+	}
+	.bubble {
+		max-width: 78%;
+		padding: 11px 14px;
+		font-size: 14px;
+		line-height: 1.5;
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+	.a-bubble {
+		background: var(--card);
+		border: 1px solid var(--line);
+		border-radius: 4px 16px 16px 16px;
+		box-shadow: var(--shadow);
+	}
+	.u-bubble {
+		background: var(--teal);
+		color: #fff;
+		border-radius: 16px 16px 4px 16px;
+	}
+	.notice {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		background: color-mix(in srgb, var(--lime) 22%, var(--card));
+		border: 1px solid var(--line);
+		border-radius: 12px;
+		padding: 12px 14px;
+		font-size: 14px;
+		font-weight: 500;
+	}
+	.notice .btn {
+		margin-left: auto;
+	}
+	.adjust-form {
+		display: flex;
+		gap: 10px;
+		background: var(--bg);
+		border: 1px solid var(--line);
+		border-radius: 14px;
+		padding: 8px 8px 8px 16px;
+	}
+	.adjust-form input {
+		flex: 1;
+		border: none;
+		outline: none;
+		background: transparent;
+		font-size: 15px;
+		color: var(--ink);
+		font-family: inherit;
+		min-width: 0;
+	}
+	.sendbtn {
+		border: none;
+		border-radius: 10px;
+		background: var(--lime);
+		color: var(--ink);
+		width: 42px;
+		height: 42px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: none;
+	}
+
+	@media (min-width: 560px) {
+		.adjust-modal {
+			bottom: 24px;
+			border-radius: 18px;
+		}
 	}
 
 	@media (max-width: 860px) {

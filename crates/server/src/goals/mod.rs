@@ -6,10 +6,11 @@
 //!   - `GET  /api/goals/{id}`          fetch one goal (ownership enforced)
 //!   - `PATCH /api/goals/{id}`         update mutable fields
 //!   - `POST /api/goals/{id}/roadmap`  generate a roadmap via the LLM
-//!   - `GET  /api/goals/{id}/roadmap`  fetch the roadmap + ordered steps
+//!   - `GET  /api/goals/{id}/roadmap`  fetch the roadmap + ordered steps + breaks
+//!   - `POST /api/goals/{id}/adjust`   agentic plan-adjustment (breaks + reschedule)
 //!   - `PATCH /api/steps/{id}`         update a step's status
 //!
-//! Owns migration `0003_goals.sql`.
+//! Owns migrations `0003_goals.sql` and `0012_goal_breaks.sql`.
 
 use axum::extract::{Path, State};
 use axum::routing::{get, patch, post};
@@ -62,7 +63,18 @@ pub struct StepView {
     pub created_at: String,
 }
 
-/// A roadmap plus its ordered steps.
+/// A planned unavailable period on a goal's timeline (e.g. Christmas, a holiday).
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct GoalBreak {
+    pub id: String,
+    pub label: String,
+    pub start_date: String,
+    pub end_date: String,
+}
+
+/// A roadmap plus its ordered steps and any planned breaks. When a goal has no
+/// roadmap row yet, [`get_roadmap`] still returns this shape with empty `steps`
+/// (and `id`/`created_at` empty, `model` null) so breaks are always visible.
 #[derive(Debug, Clone, Serialize)]
 pub struct RoadmapView {
     pub id: String,
@@ -70,6 +82,7 @@ pub struct RoadmapView {
     pub model: Option<String>,
     pub created_at: String,
     pub steps: Vec<StepView>,
+    pub breaks: Vec<GoalBreak>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +197,7 @@ pub fn router() -> Router<AppState> {
             "/api/goals/{id}/roadmap",
             post(generate_roadmap).get(get_roadmap),
         )
+        .route("/api/goals/{id}/adjust", post(adjust_plan))
         .route("/api/steps/{id}", patch(patch_step))
 }
 
@@ -193,6 +207,26 @@ fn now_rfc3339() -> AppResult<String> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|e| AppError::Internal(e.into()))
+}
+
+/// Is `s` a well-formed `YYYY-MM-DD` calendar date (with a plausible month/day)?
+/// Used to reject dates the model hallucinated in a bad format before persisting.
+fn valid_ymd(s: &str) -> bool {
+    let s = s.trim();
+    let parts: Vec<&str> = s.split('-').collect();
+    let [y, m, d] = parts.as_slice() else {
+        return false;
+    };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return false;
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return false;
+    }
+    let (Ok(month), Ok(day)) = (m.parse::<u8>(), d.parse::<u8>()) else {
+        return false;
+    };
+    (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 /// Coerce a possibly date-only string (`YYYY-MM-DD`) into an Rfc3339 timestamp by
@@ -407,6 +441,19 @@ async fn apply_goal_patch(
     Ok(goal)
 }
 
+/// Load a goal's planned breaks, ordered by start date. Breaks live independently
+/// of the roadmap, so this is callable whether or not a roadmap row exists.
+async fn fetch_breaks(pool: &SqlitePool, goal_id: &str) -> AppResult<Vec<GoalBreak>> {
+    sqlx::query_as::<_, GoalBreak>(
+        "SELECT id, label, start_date, end_date FROM goal_breaks \
+         WHERE goal_id = ? ORDER BY start_date ASC, id ASC",
+    )
+    .bind(goal_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))
+}
+
 async fn fetch_roadmap(pool: &SqlitePool, goal_id: &str) -> AppResult<Option<RoadmapView>> {
     let row: Option<(String, Option<String>, String)> =
         sqlx::query_as("SELECT id, model, created_at FROM roadmaps WHERE goal_id = ?")
@@ -414,6 +461,8 @@ async fn fetch_roadmap(pool: &SqlitePool, goal_id: &str) -> AppResult<Option<Roa
             .fetch_optional(pool)
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
+
+    let breaks = fetch_breaks(pool, goal_id).await?;
 
     let Some((id, model, created_at)) = row else {
         return Ok(None);
@@ -434,7 +483,26 @@ async fn fetch_roadmap(pool: &SqlitePool, goal_id: &str) -> AppResult<Option<Roa
         model,
         created_at,
         steps,
+        breaks,
     }))
+}
+
+/// Fetch the roadmap for `goal_id`, or — when no roadmap row exists yet — an empty
+/// roadmap view that still carries the goal's breaks. This lets
+/// `GET /api/goals/{id}/roadmap` always return `breaks`, even before planning.
+async fn fetch_roadmap_or_empty(pool: &SqlitePool, goal_id: &str) -> AppResult<RoadmapView> {
+    if let Some(roadmap) = fetch_roadmap(pool, goal_id).await? {
+        return Ok(roadmap);
+    }
+    let breaks = fetch_breaks(pool, goal_id).await?;
+    Ok(RoadmapView {
+        id: String::new(),
+        goal_id: goal_id.to_string(),
+        model: None,
+        created_at: String::new(),
+        steps: Vec::new(),
+        breaks,
+    })
 }
 
 async fn set_step_status(
@@ -576,7 +644,25 @@ async fn persist_roadmap(
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
 
-    for (i, step) in draft.steps.iter().enumerate() {
+    insert_roadmap_steps(state, user_id, goal_id, &roadmap_id, &draft.steps, &now).await?;
+
+    Ok(roadmap_id)
+}
+
+/// Insert an ordered list of steps into an existing roadmap (`ord` = index), seed
+/// a reminder for each dated step, and best-effort embed each step. Shared by the
+/// roadmap-generation path ([`persist_roadmap`]) and the plan-adjustment path
+/// ([`replace_milestones`]). The caller is responsible for having cleared any
+/// prior steps for the roadmap.
+async fn insert_roadmap_steps(
+    state: &AppState,
+    user_id: &str,
+    goal_id: &str,
+    roadmap_id: &str,
+    steps: &[StepDraft],
+    now: &str,
+) -> AppResult<()> {
+    for (i, step) in steps.iter().enumerate() {
         let step_id = Uuid::new_v4().to_string();
         let due = step
             .due_date
@@ -597,14 +683,14 @@ async fn persist_roadmap(
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&step_id)
-        .bind(&roadmap_id)
+        .bind(roadmap_id)
         .bind(i as i64)
         .bind(&step.title)
         .bind(&step.detail)
         .bind(&due)
         .bind(&effort)
         .bind(StepStatus::Pending.as_str())
-        .bind(&now)
+        .bind(now)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
@@ -637,7 +723,7 @@ async fn persist_roadmap(
         embed_upsert(state, user_id, "step", &step_id, &step_text).await;
     }
 
-    Ok(roadmap_id)
+    Ok(())
 }
 
 /// Create a goal plus its milestone roadmap from an agent-supplied plan (no LLM
@@ -730,6 +816,134 @@ pub async fn create_goal_with_milestones(
     }
 
     Ok(goal.id)
+}
+
+// --- Break + milestone mutations ---------------------------------------------
+
+/// Add a planned break to a goal's timeline. Verifies ownership, validates the
+/// `YYYY-MM-DD` dates and a non-empty label, and returns the new break id.
+async fn add_break(
+    pool: &SqlitePool,
+    user_id: &str,
+    goal_id: &str,
+    label: &str,
+    start_date: &str,
+    end_date: &str,
+) -> AppResult<String> {
+    owned_goal(pool, user_id, goal_id).await?;
+
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(AppError::BadRequest("break label is required".to_string()));
+    }
+    let start = start_date.trim();
+    let end = end_date.trim();
+    if !valid_ymd(start) || !valid_ymd(end) {
+        return Err(AppError::BadRequest(
+            "break dates must be YYYY-MM-DD".to_string(),
+        ));
+    }
+    if end < start {
+        return Err(AppError::BadRequest(
+            "break end_date must not precede start_date".to_string(),
+        ));
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let now = now_rfc3339()?;
+    sqlx::query(
+        "INSERT INTO goal_breaks (id, goal_id, user_id, label, start_date, end_date, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(goal_id)
+    .bind(user_id)
+    .bind(label)
+    .bind(start)
+    .bind(end)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+
+    Ok(id)
+}
+
+/// Remove a break from a goal, scoped to the owner (a break belonging to another
+/// user or goal is simply not deleted).
+async fn remove_break(
+    pool: &SqlitePool,
+    user_id: &str,
+    goal_id: &str,
+    break_id: &str,
+) -> AppResult<()> {
+    owned_goal(pool, user_id, goal_id).await?;
+    sqlx::query("DELETE FROM goal_breaks WHERE id = ? AND goal_id = ? AND user_id = ?")
+        .bind(break_id)
+        .bind(goal_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(())
+}
+
+/// Replace the goal's roadmap steps with a new set of milestones. Verifies
+/// ownership, ensures a roadmap row exists (creating one with `model = "agent"`
+/// when missing), deletes the roadmap's existing steps, then inserts the new
+/// milestones (which re-seeds reminders for dated steps and re-embeds each step).
+async fn replace_milestones(
+    state: &AppState,
+    user_id: &str,
+    goal_id: &str,
+    milestones: Vec<NewMilestone>,
+) -> AppResult<()> {
+    owned_goal(&state.db, user_id, goal_id).await?;
+    let now = now_rfc3339()?;
+
+    // Ensure a roadmap row exists for this goal.
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM roadmaps WHERE goal_id = ?")
+        .bind(goal_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    let roadmap_id = match existing {
+        Some((id,)) => id,
+        None => {
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO roadmaps (id, goal_id, model, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(goal_id)
+            .bind("agent")
+            .bind(&now)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+            id
+        }
+    };
+
+    // Replace the roadmap's steps.
+    sqlx::query("DELETE FROM roadmap_steps WHERE roadmap_id = ?")
+        .bind(&roadmap_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let steps: Vec<StepDraft> = milestones
+        .into_iter()
+        .map(|m| StepDraft {
+            title: m.title,
+            detail: m.detail,
+            due_date: m.due_date,
+            effort: m.effort,
+        })
+        .collect();
+    insert_roadmap_steps(state, user_id, goal_id, &roadmap_id, &steps, &now).await?;
+
+    Ok(())
 }
 
 // --- Handlers -----------------------------------------------------------------
@@ -840,9 +1054,9 @@ async fn get_roadmap(
 ) -> AppResult<Json<RoadmapView>> {
     // Enforce ownership of the parent goal first.
     owned_goal(&state.db, &user_id, &id).await?;
-    let roadmap = fetch_roadmap(&state.db, &id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    // Always return a roadmap-or-empty view so breaks surface even before a
+    // roadmap has been generated.
+    let roadmap = fetch_roadmap_or_empty(&state.db, &id).await?;
     Ok(Json(roadmap))
 }
 
@@ -857,6 +1071,468 @@ async fn patch_step(
     ))
 }
 
+// --- Agentic plan adjustment -------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AdjustRequest {
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdjustReply {
+    reply: String,
+    changed: bool,
+}
+
+/// Title of the goal-scoped conversation that stores plan-adjustment history.
+const ADJUST_CONVERSATION_TITLE: &str = "Plan adjustments";
+
+/// The plan-adjustment coach persona. The concrete date + goal/plan/breaks
+/// context are injected at call time (see [`adjust_system_prompt`]). It is a
+/// PROPOSE-THEN-CONFIRM agent: it must describe changes in prose and only call a
+/// tool after the user explicitly confirms.
+const ADJUST_SYSTEM_PROMPT_BODY: &str = "You are AI Buddy, a warm, concise accountability coach \
+helping the user adjust the timeline of an EXISTING goal. When the user reports a disruption \
+(travel, illness, falling behind) or a planned unavailable period (e.g. \"away for Christmas \
+Dec 20-27\", \"on vacation next week\"), PROPOSE concrete changes in PROSE and ask the user to \
+confirm before doing anything. A good proposal: add a break for any unavailable period, and \
+reschedule or restructure the milestones so that no milestone due-date falls inside a break and \
+the plan still reaches the goal by its deadline. Do NOT invent breaks the user did not mention. \
+Call the tools (add_break, remove_break, update_milestones) ONLY AFTER the user has explicitly \
+confirmed your proposal in the conversation — never before, and never in the same reply as the \
+proposal. When you do call update_milestones, send the COMPLETE new ordered list of milestones \
+(it REPLACES all existing milestones), each with a realistic per-milestone effort and a YYYY-MM-DD \
+due_date between today and the deadline, avoiding every break period. After a tool succeeds, \
+briefly confirm what changed. Keep every reply short and encouraging.";
+
+/// Build the plan-adjustment system prompt with today's date and the goal's
+/// current plan (milestones) and breaks injected as grounding context.
+fn adjust_system_prompt(
+    today: &str,
+    goal: &GoalView,
+    steps: &[StepView],
+    breaks: &[GoalBreak],
+) -> String {
+    let mut ctx = format!("Today is {today}.\n{ADJUST_SYSTEM_PROMPT_BODY}\n\n");
+    ctx.push_str(&format!("GOAL: {}\n", goal.title));
+    if let Some(deadline) = goal.deadline.as_deref() {
+        if !deadline.trim().is_empty() {
+            ctx.push_str(&format!("DEADLINE: {deadline}\n"));
+        }
+    }
+    if let Some(success) = goal.success_criterion.as_deref() {
+        if !success.trim().is_empty() {
+            ctx.push_str(&format!("DEFINITION OF SUCCESS: {success}\n"));
+        }
+    }
+    ctx.push_str("CURRENT MILESTONES:\n");
+    if steps.is_empty() {
+        ctx.push_str("  (none yet)\n");
+    } else {
+        for s in steps {
+            let due = s.due_date.as_deref().unwrap_or("no date");
+            let effort = s.effort.as_deref().unwrap_or("no effort set");
+            ctx.push_str(&format!("  - {} (due {due}; effort {effort})\n", s.title));
+        }
+    }
+    ctx.push_str("CURRENT BREAKS:\n");
+    if breaks.is_empty() {
+        ctx.push_str("  (none)\n");
+    } else {
+        for b in breaks {
+            ctx.push_str(&format!(
+                "  - id={} \"{}\" {} to {}\n",
+                b.id, b.label, b.start_date, b.end_date
+            ));
+        }
+    }
+    ctx
+}
+
+/// The three plan-adjustment tools exposed to the agent, as an OpenAI `tools`
+/// array. All are called only AFTER the user confirms (enforced by the prompt).
+fn adjust_tools() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "add_break",
+                "description": "Add a planned unavailable period to the goal timeline. ONLY call \
+    after the user has confirmed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string", "description": "Short label, e.g. 'Christmas'." },
+                        "start_date": { "type": "string", "description": "First unavailable day, YYYY-MM-DD." },
+                        "end_date": { "type": "string", "description": "Last unavailable day, YYYY-MM-DD." }
+                    },
+                    "required": ["label", "start_date", "end_date"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remove_break",
+                "description": "Remove a previously added break by its id. ONLY call after the user confirms.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "break_id": { "type": "string", "description": "The id of the break to remove." }
+                    },
+                    "required": ["break_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_milestones",
+                "description": "REPLACE all of the goal's milestones with a new ordered list to \
+    reschedule/restructure the plan. ONLY call after the user confirms. Send the COMPLETE list.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "milestones": {
+                            "type": "array",
+                            "description": "The complete new ordered list of milestones.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string", "description": "Short milestone title." },
+                                    "detail": { "type": "string", "description": "Optional milestone detail." },
+                                    "due_date": { "type": "string", "description": "Target date for THIS milestone, YYYY-MM-DD, between today and the deadline and outside every break." },
+                                    "effort": { "type": "string", "description": "Realistic effort for THIS milestone, e.g. '4-5 h ride'." }
+                                },
+                                "required": ["title"]
+                            }
+                        }
+                    },
+                    "required": ["milestones"]
+                }
+            }
+        }
+    ])
+}
+
+#[derive(Debug, Deserialize)]
+struct AddBreakArgs {
+    label: String,
+    start_date: String,
+    end_date: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveBreakArgs {
+    break_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMilestonesArgs {
+    #[serde(default)]
+    milestones: Vec<NewMilestone>,
+}
+
+/// Sanitize milestones from a tool call: trim titles/efforts, drop malformed
+/// due dates and title-less milestones. Pure.
+fn sanitize_milestones(milestones: Vec<NewMilestone>) -> Vec<NewMilestone> {
+    milestones
+        .into_iter()
+        .filter_map(|mut m| {
+            m.title = m.title.trim().to_string();
+            if m.title.is_empty() {
+                return None;
+            }
+            if let Some(due) = &m.due_date {
+                if !valid_ymd(due) {
+                    m.due_date = None;
+                }
+            }
+            m.effort = m
+                .effort
+                .take()
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty());
+            Some(m)
+        })
+        .collect()
+}
+
+/// Find the goal-scoped "Plan adjustments" conversation for this user, creating
+/// one if it does not exist. Returns the conversation id.
+async fn find_or_create_adjust_conversation(
+    pool: &SqlitePool,
+    user_id: &str,
+    goal_id: &str,
+) -> AppResult<String> {
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM conversations WHERE user_id = ? AND goal_id = ? AND title = ? \
+         ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(goal_id)
+    .bind(ADJUST_CONVERSATION_TITLE)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let now = now_rfc3339()?;
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, goal_id, title, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(user_id)
+    .bind(goal_id)
+    .bind(ADJUST_CONVERSATION_TITLE)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(id)
+}
+
+/// Persist a message to a conversation and bump the conversation's recency.
+async fn insert_adjust_message(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+    cost_cents: i64,
+) -> AppResult<()> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_rfc3339()?;
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, role, content, token_cost_cents, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(conversation_id)
+    .bind(role)
+    .bind(content)
+    .bind(cost_cents)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+
+    sqlx::query("UPDATE conversations SET updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(())
+}
+
+/// Prior `user`/`assistant` messages of a conversation, oldest first, as
+/// `(role, content)` pairs.
+async fn adjust_history(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> AppResult<Vec<(String, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT role, content FROM messages WHERE conversation_id = ? \
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(rows)
+}
+
+/// One agentic plan-adjustment turn. The model proposes timeline changes in prose
+/// and, only after the user confirms, calls tools to add/remove breaks and
+/// reschedule milestones. Returns the assistant's reply and whether any tool
+/// modified the plan this turn.
+async fn adjust_plan(
+    State(state): State<AppState>,
+    RequireAuth(user_id): RequireAuth,
+    Path(id): Path<String>,
+    WithRejection(Json(body), _): WithRejection<Json<AdjustRequest>, AppError>,
+) -> AppResult<Json<AdjustReply>> {
+    let content = body.content.trim().to_string();
+    if content.is_empty() {
+        return Err(AppError::BadRequest(
+            "message content is required".to_string(),
+        ));
+    }
+
+    // Ownership (wrong owner or missing -> Forbidden/NotFound) + load the goal.
+    let goal = owned_goal(&state.db, &user_id, &id).await?;
+
+    // Wallet gate.
+    if crate::wallet::balance_cents(&state.db, &user_id).await? <= 0 {
+        return Err(AppError::PaymentRequired(
+            "Top up your wallet to keep chatting".to_string(),
+        ));
+    }
+
+    // Goal-scoped conversation for adjustment history.
+    let conv_id = find_or_create_adjust_conversation(&state.db, &user_id, &id).await?;
+    insert_adjust_message(&state.db, &conv_id, "user", &content, 0).await?;
+
+    // Current plan + breaks for grounding the system prompt.
+    let roadmap = fetch_roadmap_or_empty(&state.db, &id).await?;
+    let today = now_rfc3339()?
+        .get(..10)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let system = adjust_system_prompt(&today, &goal, &roadmap.steps, &roadmap.breaks);
+
+    // Build the OpenAI messages array: system prompt + prior history (which
+    // already includes the message just inserted).
+    let mut messages: Vec<serde_json::Value> =
+        vec![serde_json::json!({ "role": "system", "content": system })];
+    for (role, text) in adjust_history(&state.db, &conv_id).await? {
+        if role == "user" || role == "assistant" {
+            messages.push(serde_json::json!({ "role": role, "content": text }));
+        }
+    }
+
+    let tools = adjust_tools();
+    let model = crate::settings::user_chat_model(&state.db, &state.config, &user_id).await?;
+
+    let mut total_cost: i64 = 0;
+    let mut changed = false;
+    let mut reply: Option<String> = None;
+
+    for _ in 0..4 {
+        let turn = state
+            .llm
+            .chat_tools(&model, messages.clone(), &tools)
+            .await?;
+        total_cost = total_cost.saturating_add(turn.cost_cents);
+
+        if let Some(text) = &turn.content {
+            if !text.trim().is_empty() {
+                reply = Some(text.clone());
+            }
+        }
+
+        if turn.tool_calls.is_empty() {
+            break;
+        }
+
+        let tool_calls_json: Vec<serde_json::Value> = turn
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": { "name": tc.name, "arguments": tc.arguments },
+                })
+            })
+            .collect();
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": turn.content.clone().unwrap_or_default(),
+            "tool_calls": tool_calls_json,
+        }));
+
+        for tc in &turn.tool_calls {
+            let result = match tc.name.as_str() {
+                "add_break" => match serde_json::from_str::<AddBreakArgs>(&tc.arguments) {
+                    Ok(args) => {
+                        match add_break(
+                            &state.db,
+                            &user_id,
+                            &id,
+                            &args.label,
+                            &args.start_date,
+                            &args.end_date,
+                        )
+                        .await
+                        {
+                            Ok(break_id) => {
+                                changed = true;
+                                serde_json::json!({ "ok": true, "break_id": break_id })
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "add_break tool failed");
+                                serde_json::json!({ "ok": false, "error": "could not add break" })
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "add_break arguments invalid");
+                        serde_json::json!({ "ok": false, "error": "invalid arguments" })
+                    }
+                },
+                "remove_break" => match serde_json::from_str::<RemoveBreakArgs>(&tc.arguments) {
+                    Ok(args) => {
+                        match remove_break(&state.db, &user_id, &id, &args.break_id).await {
+                            Ok(()) => {
+                                changed = true;
+                                serde_json::json!({ "ok": true })
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "remove_break tool failed");
+                                serde_json::json!({ "ok": false, "error": "could not remove break" })
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "remove_break arguments invalid");
+                        serde_json::json!({ "ok": false, "error": "invalid arguments" })
+                    }
+                },
+                "update_milestones" => {
+                    match serde_json::from_str::<UpdateMilestonesArgs>(&tc.arguments) {
+                        Ok(args) => {
+                            let milestones = sanitize_milestones(args.milestones);
+                            if milestones.is_empty() {
+                                serde_json::json!({ "ok": false, "error": "no valid milestones" })
+                            } else {
+                                match replace_milestones(&state, &user_id, &id, milestones).await {
+                                    Ok(()) => {
+                                        changed = true;
+                                        serde_json::json!({ "ok": true })
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, "update_milestones tool failed");
+                                        serde_json::json!({ "ok": false, "error": "could not update milestones" })
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = ?e, "update_milestones arguments invalid");
+                            serde_json::json!({ "ok": false, "error": "invalid arguments" })
+                        }
+                    }
+                }
+                _ => serde_json::json!({ "ok": false, "error": "unknown tool" }),
+            };
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result.to_string(),
+            }));
+        }
+    }
+
+    let reply = reply.unwrap_or_else(|| "Done — your plan is updated.".to_string());
+
+    // Debit the wallet (best-effort), persist the assistant reply.
+    if total_cost > 0 {
+        if let Err(e) = crate::wallet::debit_tokens(&state.db, &user_id, total_cost, "chat").await {
+            tracing::error!(error = ?e, "wallet debit failed");
+        }
+    }
+    insert_adjust_message(&state.db, &conv_id, "assistant", &reply, total_cost).await?;
+
+    Ok(Json(AdjustReply { reply, changed }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +1543,37 @@ mod tests {
         let path = db_path.to_str().expect("utf8 path");
         let pool = crate::db::init_pool(path).await.expect("init pool");
         (dir, pool)
+    }
+
+    /// Build an [`AppState`] backed by `pool` for helpers that need it
+    /// (e.g. [`replace_milestones`]). LLM/embedding calls degrade to no-ops in
+    /// tests because no API key is configured, so nothing hits the network.
+    fn test_state(pool: SqlitePool) -> AppState {
+        use axum_extra::extract::cookie::Key;
+        let config = std::sync::Arc::new(crate::config::Config::from_env());
+        let llm = crate::llm::LlmClient::new(&config);
+        let payments = crate::wallet::PaymentProvider::new(&config);
+        let notifier = crate::notify::Notifier::new(pool.clone());
+        AppState {
+            db: pool,
+            config,
+            oidc: None,
+            cookie_key: Key::generate(),
+            llm,
+            payments,
+            notifier,
+        }
+    }
+
+    #[test]
+    fn valid_ymd_accepts_and_rejects() {
+        assert!(valid_ymd("2026-09-29"));
+        assert!(valid_ymd("  2026-12-27  "));
+        assert!(!valid_ymd("next spring"));
+        assert!(!valid_ymd("2026/09/29"));
+        assert!(!valid_ymd("2026-13-01")); // bad month
+        assert!(!valid_ymd("2026-12-40")); // bad day
+        assert!(!valid_ymd("26-9-1")); // wrong widths
     }
 
     #[test]
@@ -1182,6 +1889,224 @@ mod tests {
         assert_eq!(
             roadmap.steps.first().and_then(|s| s.effort.as_deref()),
             Some("4-5 h ride")
+        );
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_break_roundtrips() {
+        let (_dir, pool) = test_pool().await;
+        let goal = insert_goal(
+            &pool, "u1", "Goal", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
+
+        // Add two breaks.
+        let xmas = add_break(
+            &pool,
+            "u1",
+            &goal.id,
+            "Christmas",
+            "2026-12-20",
+            "2026-12-27",
+        )
+        .await
+        .expect("add xmas");
+        add_break(
+            &pool,
+            "u1",
+            &goal.id,
+            "New Year",
+            "2026-12-31",
+            "2027-01-02",
+        )
+        .await
+        .expect("add ny");
+
+        // They come back ordered by start_date.
+        let breaks = fetch_breaks(&pool, &goal.id).await.expect("fetch");
+        let labels: Vec<&str> = breaks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, vec!["Christmas", "New Year"]);
+
+        // Remove one.
+        remove_break(&pool, "u1", &goal.id, &xmas)
+            .await
+            .expect("remove");
+        let breaks = fetch_breaks(&pool, &goal.id).await.expect("fetch");
+        assert_eq!(breaks.len(), 1);
+        assert_eq!(breaks.first().map(|b| b.label.as_str()), Some("New Year"));
+    }
+
+    #[tokio::test]
+    async fn add_break_validates_ownership_and_dates() {
+        let (_dir, pool) = test_pool().await;
+        let goal = insert_goal(
+            &pool, "owner", "Goal", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
+
+        // Wrong owner is forbidden.
+        let forbidden = add_break(&pool, "intruder", &goal.id, "X", "2026-12-20", "2026-12-27")
+            .await
+            .expect_err("forbidden");
+        assert!(matches!(forbidden, AppError::Forbidden));
+
+        // Empty label rejected.
+        let bad_label = add_break(&pool, "owner", &goal.id, "  ", "2026-12-20", "2026-12-27")
+            .await
+            .expect_err("empty label");
+        assert!(matches!(bad_label, AppError::BadRequest(_)));
+
+        // Malformed date rejected.
+        let bad_date = add_break(&pool, "owner", &goal.id, "X", "Dec 20", "2026-12-27")
+            .await
+            .expect_err("bad date");
+        assert!(matches!(bad_date, AppError::BadRequest(_)));
+
+        // End before start rejected.
+        let bad_range = add_break(&pool, "owner", &goal.id, "X", "2026-12-27", "2026-12-20")
+            .await
+            .expect_err("bad range");
+        assert!(matches!(bad_range, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn sanitize_milestones_drops_bad_entries() {
+        let milestones = vec![
+            NewMilestone {
+                title: "  Base ride  ".to_string(),
+                detail: None,
+                due_date: Some("2026-11-01".to_string()),
+                effort: Some("  3 h ride  ".to_string()),
+            },
+            NewMilestone {
+                title: "Bad date".to_string(),
+                detail: None,
+                due_date: Some("not a date".to_string()),
+                effort: Some("   ".to_string()),
+            },
+            NewMilestone {
+                title: "   ".to_string(),
+                detail: None,
+                due_date: None,
+                effort: None,
+            },
+        ];
+        let clean = sanitize_milestones(milestones);
+        assert_eq!(clean.len(), 2);
+        assert_eq!(clean.first().map(|m| m.title.as_str()), Some("Base ride"));
+        assert_eq!(
+            clean.first().and_then(|m| m.effort.as_deref()),
+            Some("3 h ride")
+        );
+        // Bad date dropped to None, whitespace effort dropped to None.
+        assert_eq!(clean.get(1).and_then(|m| m.due_date.as_deref()), None);
+        assert_eq!(clean.get(1).and_then(|m| m.effort.as_deref()), None);
+    }
+
+    #[tokio::test]
+    async fn replace_milestones_creates_and_replaces_steps() {
+        let (_dir, pool) = test_pool().await;
+        let state = test_state(pool.clone());
+        let goal = insert_goal(
+            &pool, "u1", "Goal", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
+
+        // No roadmap yet: replace_milestones must create one.
+        replace_milestones(
+            &state,
+            "u1",
+            &goal.id,
+            vec![
+                NewMilestone {
+                    title: "Step A".to_string(),
+                    detail: None,
+                    due_date: Some("2026-11-01".to_string()),
+                    effort: Some("2 h".to_string()),
+                },
+                NewMilestone {
+                    title: "Step B".to_string(),
+                    detail: None,
+                    due_date: None,
+                    effort: None,
+                },
+            ],
+        )
+        .await
+        .expect("replace 1");
+
+        let roadmap = fetch_roadmap(&pool, &goal.id)
+            .await
+            .expect("fetch")
+            .expect("present");
+        let titles: Vec<&str> = roadmap.steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["Step A", "Step B"]);
+        let roadmap_id = roadmap.id.clone();
+
+        // Replace again: steps are swapped, roadmap row reused.
+        replace_milestones(
+            &state,
+            "u1",
+            &goal.id,
+            vec![NewMilestone {
+                title: "Step C".to_string(),
+                detail: None,
+                due_date: None,
+                effort: None,
+            }],
+        )
+        .await
+        .expect("replace 2");
+
+        let roadmap = fetch_roadmap(&pool, &goal.id)
+            .await
+            .expect("fetch")
+            .expect("present");
+        assert_eq!(roadmap.id, roadmap_id, "roadmap row reused");
+        let titles: Vec<&str> = roadmap.steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["Step C"]);
+
+        // Non-owner cannot replace.
+        let forbidden = replace_milestones(&state, "intruder", &goal.id, vec![])
+            .await
+            .expect_err("forbidden");
+        assert!(matches!(forbidden, AppError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn roadmap_or_empty_returns_breaks_without_roadmap() {
+        let (_dir, pool) = test_pool().await;
+        let goal = insert_goal(
+            &pool, "u1", "Goal", None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("insert");
+
+        add_break(
+            &pool,
+            "u1",
+            &goal.id,
+            "Christmas",
+            "2026-12-20",
+            "2026-12-27",
+        )
+        .await
+        .expect("add break");
+
+        // No roadmap row exists, but breaks must still surface.
+        assert!(fetch_roadmap(&pool, &goal.id)
+            .await
+            .expect("fetch")
+            .is_none());
+        let view = fetch_roadmap_or_empty(&pool, &goal.id).await.expect("view");
+        assert!(view.steps.is_empty());
+        assert_eq!(view.breaks.len(), 1);
+        assert_eq!(
+            view.breaks.first().map(|b| b.label.as_str()),
+            Some("Christmas")
         );
     }
 }
