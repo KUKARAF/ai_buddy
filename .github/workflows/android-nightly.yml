@@ -117,11 +117,25 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          OUT="ai-buddy-nightly-${GITHUB_SHA::7}.apk"
+          IN=crates/mobile/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            # No release keystore configured on this repo. Fall back to the
+            # debug-signed APK so a nightly artifact is still produced. NOTE:
+            # the Android Gradle Plugin's debug keystore is regenerated per run,
+            # so these nightlies have an unstable signing identity and Android
+            # may refuse to update one over another ("App not installed"); users
+            # must uninstall before updating. Set the ANDROID_KEYSTORE_BASE64 /
+            # ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD
+            # repo secrets to get stable, release-key-signed nightlies.
+            echo "::warning::Release keystore secrets not set; publishing the debug-signed APK unchanged. See android-nightly.yml for the secrets to configure."
+            cp "$IN" "$OUT"
+            exit 0
+          fi
           # Strip the random per-run debug signature and re-sign with the stable
           # release keystore, so every nightly shares one signing identity (see
           # the header comment). apksigner re-signs whatever it's given.
           BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
-          IN=crates/mobile/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
           # zipalign must run before apksigner (apksigner preserves alignment)
           "$BT/zipalign" -f -p 4 \
@@ -132,9 +146,9 @@ jobs:
             --ks-key-alias "$ANDROID_KEY_ALIAS" \
             --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
             --key-pass "pass:$ANDROID_KEY_PASSWORD" \
-            --out "ai-buddy-nightly-${GITHUB_SHA::7}.apk" \
+            --out "$OUT" \
             "$RUNNER_TEMP/app-aligned.apk"
-          "$BT/apksigner" verify --print-certs "ai-buddy-nightly-${GITHUB_SHA::7}.apk"
+          "$BT/apksigner" verify --print-certs "$OUT"
           rm -f "$RUNNER_TEMP/release.keystore"
 
       - name: Publish rolling nightly pre-release
