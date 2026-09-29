@@ -21,6 +21,7 @@ name: Android Nightly APK
 # committing crates/mobile/gen/.
 
 on:
+  workflow_dispatch: {}
   push:
     branches: [main]
     paths:
