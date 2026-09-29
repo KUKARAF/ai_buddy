@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
-	import { getWallet, topup, ApiError, loginUrl, type Wallet } from '$lib/api/client';
+	import { getWallet, topup, ApiError, type Wallet } from '$lib/api/client';
+	import { startLogin } from '$lib/app/login';
 	import { app } from '$lib/appState.svelte';
 	import { euros } from '$lib/format';
 
@@ -74,8 +75,7 @@
 			<span class="tile tile-sky"><Icon name="wallet" size={24} /></span>
 			<h2>Sign in to see your balance</h2>
 			<p class="muted">Your wallet is private to you.</p>
-			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- external OIDC login URL -->
-			<a class="btn btn-lime" href={loginUrl()}>Sign in</a>
+			<button class="btn btn-lime" onclick={() => void startLogin()}>Sign in</button>
 		</div>
 	{:else}
 		<div class="row-cards">

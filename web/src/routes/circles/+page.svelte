@@ -2,7 +2,8 @@
 	import { onMount } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import { categoryLook } from '$lib/goalView';
-	import { getCircleSuggestions, ApiError, loginUrl, type CircleSuggestion } from '$lib/api/client';
+	import { getCircleSuggestions, ApiError, type CircleSuggestion } from '$lib/api/client';
+	import { startLogin } from '$lib/app/login';
 
 	let circles = $state<CircleSuggestion[]>([]);
 	let loading = $state(true);
@@ -55,8 +56,7 @@
 			<span class="tile tile-sky"><Icon name="lock" size={24} /></span>
 			<h2>Sign in to find your circles</h2>
 			<p class="muted">Circles are matched to your goals, so they're private to you.</p>
-			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- external OIDC login URL -->
-			<a class="btn btn-lime" href={loginUrl()}>Sign in</a>
+			<button class="btn btn-lime" onclick={() => void startLogin()}>Sign in</button>
 		</div>
 	{:else if loadError}
 		<p class="error state">{loadError}</p>

@@ -7,14 +7,30 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import { app } from '$lib/appState.svelte';
 	import { coach } from '$lib/coachState.svelte';
-	import { loginUrl } from '$lib/api/client';
+	import { IS_APP } from '$lib/api/deviceToken';
+	import { startLogin } from '$lib/app/login';
 
 	let { children } = $props();
 
 	let menuOpen = $state(false);
 
 	onMount(() => {
-		void app.ensureLoaded();
+		let unlistenDeepLink: (() => void) | undefined;
+
+		void (async () => {
+			// App build: the OIDC login returns the device token via the
+			// `dev.aibuddy.app://auth?token=<raw>` deep link. Register the handler
+			// (and process any cold-start launch URL) before the initial load so a
+			// launch via the login deep link lands signed in. When a token arrives,
+			// re-fetch /auth/me + goals so the guest state flips to signed-in.
+			if (IS_APP) {
+				const { initDeepLinkAuth } = await import('$lib/app/deepLinkAuth');
+				unlistenDeepLink = await initDeepLinkAuth(() => app.reload());
+			}
+			await app.ensureLoaded();
+		})();
+
+		return () => unlistenDeepLink?.();
 	});
 
 	const nav = [
@@ -50,7 +66,7 @@
 	async function startCoach(): Promise<void> {
 		await app.ensureLoaded();
 		if (app.isGuest) {
-			window.location.href = loginUrl();
+			await startLogin();
 			return;
 		}
 		coach.startNew();
@@ -118,8 +134,7 @@
 				<span class="avatar">G</span>
 				<span class="who">
 					<strong>Guest</strong>
-					<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- external OIDC login URL -->
-					<a class="signin small" href={loginUrl()}>Sign in</a>
+					<button class="signin small" onclick={() => void startLogin()}>Sign in</button>
 				</span>
 			{/if}
 			<a
@@ -169,7 +184,8 @@
 		flex: none;
 		background: var(--bg);
 		border-right: 1px solid var(--line);
-		padding: 22px 16px;
+		padding: calc(22px + var(--safe-top)) 16px calc(22px + var(--safe-bottom));
+		padding-left: calc(16px + var(--safe-left));
 		display: flex;
 		flex-direction: column;
 		gap: 18px;
@@ -311,6 +327,14 @@
 	.signin {
 		color: var(--sky-ink);
 		font-weight: 600;
+		background: none;
+		border: none;
+		padding: 0;
+		text-align: left;
+		align-self: flex-start;
+	}
+	.signin:hover {
+		text-decoration: underline;
 	}
 	.gearbtn {
 		display: inline-flex;
@@ -343,13 +367,18 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: 12px;
-		padding: 18px 28px;
+		/* Add the status-bar inset on top so the bar's content clears the Android
+		   status bar (the sticky, translucent bar itself extends up under it). */
+		padding: calc(18px + var(--safe-top)) calc(28px + var(--safe-right)) 18px
+			calc(28px + var(--safe-left));
 		border-bottom: 1px solid var(--line);
 		position: sticky;
 		top: 0;
 		background: color-mix(in srgb, var(--bg) 88%, transparent);
 		backdrop-filter: blur(6px);
-		z-index: 5;
+		/* Above page content and tappable; the drawer + its backdrop (below) sit
+		   above this only while the menu is open. */
+		z-index: 20;
 	}
 	.topbar-left,
 	.topbar-right {
@@ -381,7 +410,8 @@
 	}
 
 	.content {
-		padding: 24px 28px 60px;
+		padding: 24px calc(28px + var(--safe-right)) calc(60px + var(--safe-bottom))
+			calc(28px + var(--safe-left));
 		max-width: 1180px;
 		width: 100%;
 	}
@@ -396,7 +426,11 @@
 			position: fixed;
 			left: 0;
 			top: 0;
-			z-index: 30;
+			width: min(288px, 84vw);
+			/* Above the topbar (20) and its backdrop (30) so the open drawer sits on
+			   top; when closed it's translated fully off-canvas and can't intercept
+			   taps on the topbar. */
+			z-index: 40;
 			transform: translateX(-100%);
 			transition: transform 0.2s ease;
 			box-shadow: 0 8px 40px rgba(20, 40, 45, 0.18);
@@ -406,20 +440,31 @@
 		}
 		.menubtn {
 			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-width: 44px;
+			min-height: 44px;
+		}
+		.newgoal {
+			padding: 11px 15px;
 		}
 		.backdrop {
 			display: block;
 			position: fixed;
 			inset: 0;
-			z-index: 20;
+			/* Between the topbar (20) and the drawer (40): dims + blocks the topbar's
+			   buttons while the menu is open, but stays below the drawer itself. */
+			z-index: 30;
 			border: none;
 			background: rgba(20, 40, 45, 0.35);
 		}
 		.topbar {
-			padding: 14px 16px;
+			padding: calc(14px + var(--safe-top)) calc(16px + var(--safe-right)) 14px
+				calc(16px + var(--safe-left));
 		}
 		.content {
-			padding: 18px 16px 56px;
+			padding: 18px calc(16px + var(--safe-right)) calc(56px + var(--safe-bottom))
+				calc(16px + var(--safe-left));
 		}
 		.private {
 			display: none;

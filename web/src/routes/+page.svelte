@@ -4,7 +4,8 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import GoalCard from '$lib/components/GoalCard.svelte';
 	import { app } from '$lib/appState.svelte';
-	import { getRoadmap, loginUrl, type Roadmap, type RoadmapStep } from '$lib/api/client';
+	import { getRoadmap, type Roadmap, type RoadmapStep } from '$lib/api/client';
+	import { startLogin } from '$lib/app/login';
 	import { dateEyebrow, shortDate } from '$lib/format';
 	import { goalLook } from '$lib/goalView';
 	import { coach } from '$lib/coachState.svelte';
@@ -13,7 +14,7 @@
 	async function startCoach(): Promise<void> {
 		await app.ensureLoaded();
 		if (app.isGuest) {
-			window.location.href = loginUrl();
+			await startLogin();
 			return;
 		}
 		coach.startNew();

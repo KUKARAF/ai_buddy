@@ -3,7 +3,7 @@
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
 	import { app } from '$lib/appState.svelte';
-	import { loginUrl } from '$lib/api/client';
+	import { startLogin } from '$lib/app/login';
 	import { coach } from '$lib/coachState.svelte';
 	import { categoryLook } from '$lib/goalView';
 
@@ -57,7 +57,7 @@
 	async function makeGoal(idea: Idea): Promise<void> {
 		await app.ensureLoaded();
 		if (app.isGuest) {
-			window.location.href = loginUrl();
+			await startLogin();
 			return;
 		}
 		coach.seedNew(`I want to: ${idea.title}`);

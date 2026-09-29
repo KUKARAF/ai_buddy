@@ -7,10 +7,10 @@
 		getConversation,
 		sendAgentMessage,
 		getSettings,
-		loginUrl,
 		ApiError
 	} from '$lib/api/client';
 	import { app } from '$lib/appState.svelte';
+	import { startLogin } from '$lib/app/login';
 	import { coach } from '$lib/coachState.svelte';
 
 	// The active coach model, shown as a small muted label in the header.
@@ -55,7 +55,7 @@
 			// login before rendering the composer or creating any conversation.
 			await app.ensureLoaded();
 			if (app.isGuest) {
-				window.location.href = loginUrl();
+				await startLogin();
 				return;
 			}
 			ready = true;

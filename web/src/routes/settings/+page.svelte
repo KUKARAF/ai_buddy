@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
-	import { getSettings, updateSettings, ApiError, loginUrl, type Settings } from '$lib/api/client';
+	import { getSettings, updateSettings, ApiError, type Settings } from '$lib/api/client';
+	import { startLogin } from '$lib/app/login';
 
 	let settings = $state<Settings | null>(null);
 	let loading = $state(true);
@@ -71,8 +72,7 @@
 			<span class="tile tile-sky"><Icon name="gear" size={24} /></span>
 			<h2>Sign in to change your settings</h2>
 			<p class="muted">Your preferences are private to you.</p>
-			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- external OIDC login URL -->
-			<a class="btn btn-lime" href={loginUrl()}>Sign in</a>
+			<button class="btn btn-lime" onclick={() => void startLogin()}>Sign in</button>
 		</div>
 	{:else}
 		<section class="card model-card">

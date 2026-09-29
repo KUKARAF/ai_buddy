@@ -31,6 +31,16 @@ class AppState {
 		return this.loadPromise;
 	}
 
+	/**
+	 * Force a fresh auth + data load, discarding the memoized promise. Used after
+	 * a sign-in completes (e.g. the app's device-token deep link arrives) so the
+	 * UI re-fetches /auth/me + goals and flips out of the guest state.
+	 */
+	reload(): Promise<void> {
+		this.loadPromise = this.load();
+		return this.loadPromise;
+	}
+
 	/** First name for greetings, from display_name; falls back to "there". */
 	get firstName(): string {
 		const name = this.me?.display_name?.trim();

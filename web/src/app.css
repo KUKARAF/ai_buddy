@@ -33,6 +33,17 @@
 	--shadow: 0 1px 2px rgba(20, 40, 45, 0.04), 0 1px 3px rgba(20, 40, 45, 0.06);
 
 	--font: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+	/* Safe-area insets (status bar / notch / nav bar).
+	   On the Tauri Android app, `tauri-plugin-edge-to-edge` injects
+	   `--safe-area-inset-*` on the documentElement. The Android System WebView
+	   often returns 0 for the standard `env(safe-area-inset-*)`, so each token
+	   takes the MAX of the CSS `env()` value and the plugin-injected variable
+	   (falling back to 0px on the web build where neither is set). */
+	--safe-top: max(env(safe-area-inset-top), var(--safe-area-inset-top, 0px));
+	--safe-right: max(env(safe-area-inset-right), var(--safe-area-inset-right, 0px));
+	--safe-bottom: max(env(safe-area-inset-bottom), var(--safe-area-inset-bottom, 0px));
+	--safe-left: max(env(safe-area-inset-left), var(--safe-area-inset-left, 0px));
 }
 
 * {
