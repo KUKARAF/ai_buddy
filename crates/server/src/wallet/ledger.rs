@@ -203,17 +203,39 @@ pub async fn credit_topup(
     .await
     .map_err(|e| AppError::Internal(e.into()))?;
 
-    insert_ledger(
-        &mut tx,
-        user_id,
-        LedgerKind::Topup,
-        cents,
-        None,
-        Some(external_ref),
-        None,
-        &now,
+    // The idempotency check above (fast path) plus the UNIQUE index on
+    // (kind, external_ref) for topups (migration 0009) make this atomic: if a
+    // concurrent webhook redelivery records this `external_ref` first, the
+    // insert fails with a unique-violation. We treat that as "already
+    // credited", rolling back our stale balance bump so the wallet is credited
+    // exactly once.
+    let id = uuid::Uuid::new_v4().to_string();
+    let insert = sqlx::query(
+        "INSERT INTO ledger_entries \
+         (id, user_id, kind, amount_cents, goal_id, external_ref, memo, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .await?;
+    .bind(&id)
+    .bind(user_id)
+    .bind(LedgerKind::Topup.as_str())
+    .bind(cents)
+    .bind(Option::<&str>::None)
+    .bind(Some(external_ref))
+    .bind(Option::<&str>::None)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await;
+
+    match insert {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            tx.rollback()
+                .await
+                .map_err(|e| AppError::Internal(e.into()))?;
+            return Ok(());
+        }
+        Err(e) => return Err(AppError::Internal(e.into())),
+    }
 
     tx.commit()
         .await

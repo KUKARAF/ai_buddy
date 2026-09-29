@@ -46,6 +46,7 @@ impl OidcClient {
     pub async fn discover(config: &Config) -> anyhow::Result<Self> {
         let http_client = openidconnect::reqwest::ClientBuilder::new()
             .redirect(openidconnect::reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
             .build()?;
 
         let issuer_url = IssuerUrl::new(config.authentik_issuer_url.clone())?;
@@ -164,6 +165,10 @@ async fn login(
     cookie.set_path("/auth");
     cookie.set_http_only(true);
     cookie.set_same_site(axum_extra::extract::cookie::SameSite::Lax);
+    // Match the session cookie's `Secure` flag: the flow cookie carries the
+    // PKCE verifier (an http-only, encrypted secret), so it must never travel
+    // over cleartext when the deployment is HTTPS.
+    cookie.set_secure(state.config.cookie_secure());
     cookie.set_max_age(FLOW_COOKIE_MAX_AGE);
     let jar = jar.add(cookie);
 

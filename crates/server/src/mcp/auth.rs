@@ -17,6 +17,7 @@
 //!     extensions for the MCP handlers to read.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -31,6 +32,10 @@ use tokio::sync::RwLock;
 
 use crate::auth::device_token::bearer_from_headers;
 use crate::config::Config;
+
+/// Bound on the OIDC-discovery + JWKS fetches. The issuer's metadata endpoints
+/// are small; a slow/hung server must not pin an MCP request open indefinitely.
+const JWKS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The authenticated MCP user id, injected into request extensions by
 /// [`McpAuth::require`] and read back by tool/resource handlers (through the
@@ -74,7 +79,16 @@ impl McpAuth {
             resource_uri: config.mcp_resource_uri.clone(),
             audience: config.mcp_audience.clone(),
             prm_url,
-            http: reqwest::Client::new(),
+            // Harden the outbound client: no redirects (a compromised issuer
+            // discovery document must not turn JWKS fetching into an SSRF
+            // vector) and a bounded timeout so a slow endpoint can't hang a
+            // request. Fall back to a default client if the builder fails
+            // (panic-safe — never unwraps).
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(JWKS_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             jwks: RwLock::new(None),
         })
     }

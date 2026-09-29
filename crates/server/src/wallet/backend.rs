@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use time::OffsetDateTime;
 
 use super::{PaymentBackend, TopupSession, WebhookEvent};
@@ -13,6 +14,8 @@ use super::{PaymentBackend, TopupSession, WebhookEvent};
 const STRIPE_API_BASE: &str = "https://api.stripe.com";
 /// Reject webhook events whose timestamp is more than this many seconds from now.
 const WEBHOOK_TOLERANCE_SECS: i64 = 300;
+/// Bound on outbound Stripe API calls (checkout session creation).
+const STRIPE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dev/default backend: no external calls, instant success. The top-up HTTP
 /// handler credits immediately because `checkout_url` is `None`.
@@ -55,7 +58,14 @@ impl StripePaymentBackend {
             secret_key,
             webhook_secret,
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            // Bound the Stripe client (no redirects + timeout) so an upstream
+            // hiccup can't pin a top-up request open. Fallback keeps `new`
+            // panic-safe.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(STRIPE_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }
