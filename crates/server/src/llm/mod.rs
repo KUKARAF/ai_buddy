@@ -1,9 +1,10 @@
 //! LLM chat + embeddings client.
 //!
-//! Chat/roadmap completions are served by a configurable, OpenAI-compatible
-//! provider — the LiteLLM proxy by default, or OpenRouter when
-//! `AIBUDDY_LLM_PROVIDER=openrouter` (the revert switch). Embeddings ALWAYS go
-//! to OpenRouter (LiteLLM has no embeddings endpoint).
+//! Chat/roadmap completions AND embeddings are served by a configurable,
+//! OpenAI-compatible provider — the LiteLLM proxy by default (chat via the
+//! selected model, embeddings via `bge-m3`), or OpenRouter when
+//! `AIBUDDY_LLM_PROVIDER=openrouter` (the revert switch; note OpenRouter has no
+//! native embeddings — it proxies to OpenAI via a BYOK key).
 //!
 //! Exposes:
 //!   - non-streaming chat ([`LlmClient::chat`]),
@@ -80,7 +81,9 @@ struct Inner {
     default_chat_model: String,
     /// Chat model ids a user may select.
     allowed_chat_models: Vec<String>,
-    /// Embeddings always use OpenRouter, so keep its key separately.
+    /// Full embeddings URL (provider-dependent).
+    embed_url: String,
+    /// API key for the embeddings provider.
     embed_api_key: Option<String>,
     embedding_model: String,
     #[allow(dead_code)]
@@ -98,8 +101,7 @@ impl LlmClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        // Pick the chat endpoint + key by provider. Embeddings always use
-        // OpenRouter regardless of this choice.
+        // Pick the chat endpoint + key by provider (embeddings mirror it below).
         let (chat_url, chat_api_key) = if config.llm_provider == "openrouter" {
             (
                 OPENROUTER_CHAT_URL.to_string(),
@@ -116,6 +118,21 @@ impl LlmClient {
             )
         };
 
+        // Embeddings follow the same provider. LiteLLM serves `bge-m3` etc.;
+        // OpenRouter's /embeddings proxies to OpenAI (BYOK) and is only used when
+        // llm_provider=openrouter. The OpenRouter URLs/keys stay wired for revert.
+        let (embed_url, embed_api_key) = if config.llm_provider == "openrouter" {
+            (EMBED_URL.to_string(), config.openrouter_api_key.clone())
+        } else {
+            (
+                format!(
+                    "{}/embeddings",
+                    config.litellm_base_url.trim_end_matches('/')
+                ),
+                config.litellm_api_key.clone(),
+            )
+        };
+
         Self {
             inner: std::sync::Arc::new(Inner {
                 http,
@@ -123,7 +140,8 @@ impl LlmClient {
                 chat_api_key,
                 default_chat_model: config.chat_model.clone(),
                 allowed_chat_models: config.allowed_chat_models.clone(),
-                embed_api_key: config.openrouter_api_key.clone(),
+                embed_url,
+                embed_api_key,
                 embedding_model: config.embedding_model.clone(),
                 embedding_dim: config.embedding_dim,
             }),
@@ -152,12 +170,12 @@ impl LlmClient {
             .ok_or_else(|| AppError::BadRequest("LLM API key not configured".to_string()))
     }
 
-    /// The OpenRouter API key used for embeddings, or a `BadRequest` when unset.
+    /// The embeddings provider's API key, or a `BadRequest` when unset.
     fn require_embed_key(&self) -> AppResult<&str> {
         self.inner
             .embed_api_key
             .as_deref()
-            .ok_or_else(|| AppError::BadRequest("OpenRouter API key not configured".to_string()))
+            .ok_or_else(|| AppError::BadRequest("embeddings API key not configured".to_string()))
     }
 
     /// Non-streaming chat completion with an explicit `model`. `system` is
@@ -361,14 +379,12 @@ impl LlmClient {
         let resp = self
             .inner
             .http
-            .post(EMBED_URL)
+            .post(&self.inner.embed_url)
             .bearer_auth(key)
             .json(&body)
             .send()
             .await
-            .map_err(|e| {
-                AppError::Internal(anyhow!("OpenRouter embeddings request failed: {e}"))
-            })?;
+            .map_err(|e| AppError::Internal(anyhow!("embeddings request failed: {e}")))?;
 
         let parsed: EmbedResponse = read_json(resp).await?;
         let embedding = parsed
@@ -376,7 +392,9 @@ impl LlmClient {
             .into_iter()
             .next()
             .map(|d| d.embedding)
-            .ok_or_else(|| AppError::Internal(anyhow!("OpenRouter returned no embedding")))?;
+            .ok_or_else(|| {
+                AppError::Internal(anyhow!("embeddings provider returned no embedding"))
+            })?;
 
         // Fall back to a rough token estimate (~4 chars/token) if usage is absent.
         let tokens = parsed

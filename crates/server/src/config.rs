@@ -163,12 +163,17 @@ impl Config {
                         "gemma4-26b".to_string(),
                     ]
                 }),
+            // Embeddings run through the same provider as chat by default.
+            // LiteLLM serves `bge-m3` (1024-dim, FOSS, self-hosted); OpenRouter
+            // has no native embeddings (it proxies to OpenAI via BYOK), so it is
+            // only used for embeddings when llm_provider=openrouter AND a valid
+            // OpenAI-backed key is configured there.
             embedding_model: std::env::var("AIBUDDY_EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "openai/text-embedding-3-small".to_string()),
+                .unwrap_or_else(|_| "bge-m3".to_string()),
             embedding_dim: std::env::var("AIBUDDY_EMBEDDING_DIM")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1536),
+                .unwrap_or(1024),
 
             stripe_secret_key: std::env::var("AIBUDDY_STRIPE_SECRET_KEY")
                 .ok()
