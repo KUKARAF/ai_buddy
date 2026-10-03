@@ -18,6 +18,7 @@ use crate::goals;
 use crate::notify;
 use crate::settings;
 use crate::state::AppState;
+use crate::todos;
 use crate::wallet;
 
 /// Max accepted request body. Chat messages / roadmaps are small; 1 MiB is
@@ -42,6 +43,7 @@ pub fn build(state: AppState) -> Router {
         .merge(checkins::router())
         .merge(circles::router())
         .merge(settings::router())
+        .merge(todos::router())
         .merge(wallet::router())
         .merge(notify::router())
         .layer(TimeoutLayer::with_status_code(

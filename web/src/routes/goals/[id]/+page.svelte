@@ -9,6 +9,7 @@
 	import { shortDate, relativeDate, euros } from '$lib/format';
 	import { goalLook } from '$lib/goalView';
 	import { buildIcs, downloadIcs, icsFilename, type IcsEvent } from '$lib/ics';
+	import { celebrate } from '$lib/celebrate';
 	import {
 		getGoal,
 		getRoadmap,
@@ -24,6 +25,9 @@
 		confirmPledge,
 		getWallet,
 		getSimilar,
+		getStepTodos,
+		generateStepTodos,
+		toggleTodo,
 		ApiError,
 		type Goal,
 		type Roadmap,
@@ -32,7 +36,8 @@
 		type CheckIn,
 		type Pledge,
 		type SimilarGoals,
-		type AdjustProposal
+		type AdjustProposal,
+		type Todo
 	} from '$lib/api/client';
 
 	const goalId = page.params.id ?? '';
@@ -52,6 +57,23 @@
 
 	// step toggle guard
 	const toggling: Record<string, true> = {};
+	// Milestone node elements, keyed by step id — used as the confetti origin.
+	const nodeEls: Record<string, HTMLElement> = {};
+
+	// --- Per-milestone TODOs ---------------------------------------------------
+	// Loaded TODO lists + a per-step lifecycle flag so we generate at most once.
+	let todosByStep = $state<Record<string, Todo[]>>({});
+	type TodoState = 'generating' | 'generated' | 'topup' | 'error';
+	let todoGenState = $state<Record<string, TodoState>>({});
+	const togglingTodo: Record<string, true> = {};
+	// Brief confirmation after a check-in auto-ticks some TODOs.
+	let tickedConfirm = $state<string | null>(null);
+	let tickedTimer: ReturnType<typeof setTimeout> | null = null;
+
+	// Cycling emojis for the "Planning your journey" placeholder.
+	const PLANNING_EMOJIS = ['🗺️', '🧭', '🚴', '✨', '🎯'];
+	let planningEmoji = $state(0);
+	let planningTimer: ReturnType<typeof setInterval> | null = null;
 
 	// check-in composer
 	let composerOpen = $state(false);
@@ -128,6 +150,10 @@
 	const pct = $derived(steps.length > 0 ? Math.round((doneCount / steps.length) * 100) : 0);
 	const allDone = $derived(steps.length > 0 && doneCount === steps.length);
 
+	// The current milestone: the first step (in order) that isn't done yet. Only
+	// this milestone shows its TODO list.
+	const currentStep = $derived<RoadmapStep | null>(steps.find((s) => s.status !== 'done') ?? null);
+
 	// Milestones + planned breaks, merged into one chronological timeline. When
 	// there are no breaks this is exactly the milestone list (same look as before).
 	// Milestone numbers stay tied to the milestone's own order, not merged index.
@@ -156,6 +182,96 @@
 		return merged;
 	});
 
+	// Ensure the given step has its TODO list: fetch what exists, and only when
+	// there's nothing yet ask the coach to generate it — exactly once per step.
+	// A 402 surfaces as a "top up" note; other failures as a retry affordance.
+	async function ensureTodos(stepId: string): Promise<void> {
+		const st = todoGenState[stepId];
+		if (st === 'generating' || st === 'generated') return;
+		// Set synchronously so the generation $effect can't double-fire while we
+		// await, and so the placeholder shows right away.
+		todoGenState = { ...todoGenState, [stepId]: 'generating' };
+		let existing: Todo[] = [];
+		try {
+			existing = await getStepTodos(stepId);
+		} catch {
+			/* treat as none-yet and fall through to generate */
+		}
+		if (existing.length > 0) {
+			todosByStep = { ...todosByStep, [stepId]: existing };
+			todoGenState = { ...todoGenState, [stepId]: 'generated' };
+			return;
+		}
+		try {
+			const generated = await generateStepTodos(stepId);
+			todosByStep = { ...todosByStep, [stepId]: generated };
+			todoGenState = { ...todoGenState, [stepId]: 'generated' };
+		} catch (err) {
+			todoGenState = {
+				...todoGenState,
+				[stepId]: err instanceof ApiError && err.status === 402 ? 'topup' : 'error'
+			};
+		}
+	}
+
+	function retryTodos(stepId: string): void {
+		void ensureTodos(stepId);
+	}
+
+	async function toggleTodoItem(stepId: string, todo: Todo): Promise<void> {
+		if (togglingTodo[todo.id]) return;
+		togglingTodo[todo.id] = true;
+		const next = !todo.done;
+		// Optimistic flip.
+		todosByStep = {
+			...todosByStep,
+			[stepId]: (todosByStep[stepId] ?? []).map((t) =>
+				t.id === todo.id ? { ...t, done: next } : t
+			)
+		};
+		try {
+			const updated = await toggleTodo(todo.id, next);
+			todosByStep = {
+				...todosByStep,
+				[stepId]: (todosByStep[stepId] ?? []).map((t) => (t.id === todo.id ? updated : t))
+			};
+		} catch {
+			// Revert to the original on failure.
+			todosByStep = {
+				...todosByStep,
+				[stepId]: (todosByStep[stepId] ?? []).map((t) =>
+					t.id === todo.id ? { ...t, done: todo.done } : t
+				)
+			};
+		} finally {
+			delete togglingTodo[todo.id];
+		}
+	}
+
+	// Lazily generate the current milestone's TODOs the first time its plan is
+	// shown. Gated on the plan tab so we never spend on a milestone the user
+	// isn't looking at; guarded so it runs at most once per step.
+	$effect(() => {
+		if (tab !== 'plan') return;
+		const cs = currentStep;
+		if (!cs) return;
+		if (todoGenState[cs.id]) return;
+		void ensureTodos(cs.id);
+	});
+
+	// Cycle the placeholder emoji only while the current milestone is generating.
+	$effect(() => {
+		const generating = currentStep && todoGenState[currentStep.id] === 'generating';
+		if (generating && planningTimer === null) {
+			planningTimer = setInterval(() => {
+				planningEmoji = (planningEmoji + 1) % PLANNING_EMOJIS.length;
+			}, 500);
+		} else if (!generating && planningTimer !== null) {
+			clearInterval(planningTimer);
+			planningTimer = null;
+		}
+	});
+
 	const metaBits = $derived.by(() => {
 		if (!goal) return [];
 		const bits: string[] = [];
@@ -176,6 +292,8 @@
 				...roadmap,
 				steps: roadmap.steps.map((s) => (s.id === step.id ? { ...s, status: updated.status } : s))
 			};
+			// Celebrate only a milestone being completed — never when un-doing it.
+			if (updated.status === 'done') void celebrate(nodeEls[step.id]);
 		} catch {
 			/* leave as-is on failure */
 		} finally {
@@ -199,6 +317,20 @@
 			// Keep the text (and the chosen photo) so the user can retry.
 			checkinSubmitting = false;
 			return;
+		}
+		// The check-in note may have auto-ticked some of the current milestone's
+		// TODOs server-side: refetch them so the ticks show, and confirm briefly.
+		// We leave milestone-completion to the user's explicit tap.
+		if (created.todos_completed?.length) {
+			tickedConfirm = `✓ Ticked off: ${created.todos_completed.map((t) => t.title).join(', ')}`;
+			if (tickedTimer !== null) clearTimeout(tickedTimer);
+			tickedTimer = setTimeout(() => (tickedConfirm = null), 6000);
+			const cs = currentStep;
+			if (cs) {
+				void getStepTodos(cs.id)
+					.then((ts) => (todosByStep = { ...todosByStep, [cs.id]: ts }))
+					.catch(() => {});
+			}
 		}
 		// Photo is best-effort: the check-in already succeeded above.
 		const file = photoFile;
@@ -308,6 +440,8 @@
 
 	onDestroy(() => {
 		for (const url of Object.values(photoUrls)) URL.revokeObjectURL(url);
+		if (planningTimer !== null) clearInterval(planningTimer);
+		if (tickedTimer !== null) clearTimeout(tickedTimer);
 	});
 
 	// --- Add to calendar (.ics, pure client-side) ------------------------------
@@ -644,6 +778,7 @@
 										<li class:done={item.step.status === 'done'}>
 											<button
 												class="node"
+												bind:this={nodeEls[item.step.id]}
 												aria-label={item.step.status === 'done'
 													? 'Mark step not done'
 													: 'Mark step done'}
@@ -675,6 +810,56 @@
 													>
 														📅 Add to calendar
 													</button>
+												{/if}
+
+												{#if currentStep && item.step.id === currentStep.id}
+													{@const sid = item.step.id}
+													<div class="todos">
+														{#if todoGenState[sid] === 'generating'}
+															<div class="planning" aria-live="polite">
+																<span class="planning-emoji" aria-hidden="true"
+																	>{PLANNING_EMOJIS[planningEmoji]}</span
+																>
+																<span class="planning-text">Planning your journey</span>
+															</div>
+														{:else if todoGenState[sid] === 'topup'}
+															<p class="todos-note">
+																Top up your wallet to plan this milestone.
+																<a class="wallet-link" href={resolve('/wallet')}>
+																	Open wallet <Icon name="chevron-r" size={13} />
+																</a>
+															</p>
+														{:else if todoGenState[sid] === 'error'}
+															<p class="todos-note">
+																Couldn't plan this milestone.
+																<button
+																	type="button"
+																	class="todo-retry"
+																	onclick={() => retryTodos(sid)}
+																>
+																	Try again
+																</button>
+															</p>
+														{:else if (todosByStep[sid] ?? []).length > 0}
+															<p class="todos-label">To-dos for this milestone</p>
+															<ul class="todo-list">
+																{#each todosByStep[sid] as todo (todo.id)}
+																	<li class="todo-item" class:done={todo.done}>
+																		<label class="todo-row">
+																			<input
+																				type="checkbox"
+																				class="todo-check"
+																				checked={todo.done}
+																				disabled={!!togglingTodo[todo.id]}
+																				onchange={() => toggleTodoItem(sid, todo)}
+																			/>
+																			<span class="todo-text">{todo.title}</span>
+																		</label>
+																	</li>
+																{/each}
+															</ul>
+														{/if}
+													</div>
 												{/if}
 											</div>
 										</li>
@@ -1033,6 +1218,10 @@
 			</div>
 		{/if}
 
+		{#if tickedConfirm}
+			<div class="toast" role="status" aria-live="polite">{tickedConfirm}</div>
+		{/if}
+
 		{#if lightbox}
 			<div
 				class="lightbox"
@@ -1244,6 +1433,107 @@
 	}
 	.complete {
 		margin-top: 14px;
+	}
+
+	/* per-milestone TODO list + its generating placeholder */
+	.todos {
+		margin-top: 12px;
+	}
+	.todos-label {
+		margin: 0 0 8px;
+		font-size: 11px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: var(--muted);
+	}
+	.todo-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.todo-row {
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		padding: 7px 8px;
+		border-radius: 10px;
+		cursor: pointer;
+	}
+	.todo-row:hover {
+		background: var(--tag-bg);
+	}
+	.todo-check {
+		margin: 1px 0 0;
+		width: 17px;
+		height: 17px;
+		flex: none;
+		accent-color: var(--lime);
+		cursor: pointer;
+	}
+	.todo-text {
+		font-size: 14px;
+		line-height: 1.4;
+		color: var(--ink);
+	}
+	.todo-item.done .todo-text {
+		text-decoration: line-through;
+		color: var(--muted);
+	}
+	.planning {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 10px 12px;
+		border: 1px dashed var(--line);
+		border-radius: 12px;
+		background: var(--tag-bg);
+	}
+	.planning-emoji {
+		font-size: 18px;
+		line-height: 1;
+	}
+	.planning-text {
+		font-size: 14px;
+		font-weight: 600;
+		color: var(--muted);
+	}
+	.todos-note {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		margin: 0;
+		font-size: 13px;
+		color: var(--muted);
+	}
+	.todo-retry {
+		background: transparent;
+		border: none;
+		padding: 0;
+		font: inherit;
+		font-weight: 600;
+		color: var(--sky-ink);
+		cursor: pointer;
+		text-decoration: underline;
+	}
+	.toast {
+		position: fixed;
+		left: 50%;
+		bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+		transform: translateX(-50%);
+		z-index: 45;
+		max-width: calc(100vw - 32px);
+		background: var(--teal);
+		color: #fff;
+		font-size: 14px;
+		font-weight: 600;
+		padding: 11px 16px;
+		border-radius: 999px;
+		box-shadow: var(--shadow);
 	}
 
 	.ci-head {
