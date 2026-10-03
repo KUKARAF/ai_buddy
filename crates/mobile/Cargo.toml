@@ -42,5 +42,20 @@ tauri-plugin-edge-to-edge = "=0.3.3"
 tauri-plugin-deep-link = "2.4.9"
 tauri-plugin-opener = "2.5.4"
 
+# FCM push RECEIVING on Android. Choochmeque's maintained fork of the Tauri
+# notification plugin adds push delivery (FCM/APNs/UnifiedPush) behind the
+# `push-notifications` cargo feature; the feature bundles the Firebase Cloud
+# Messaging SDK into the plugin's own Android library module, so the app only
+# has to ship google-services.json + the Google Services Gradle plugin (injected
+# in CI — see .github/workflows/android-*.yml).
+#
+# Pinned EXACTLY to 0.5.0-rc.14: the 0.5 line is published on crates.io only as
+# pre-releases (no stable 0.5.0 yet), and a plain "0.5" requirement will NOT
+# resolve to a -rc version, so the exact pre-release must be named. Keep this in
+# lockstep with the @choochmeque/tauri-plugin-notifications-api npm package
+# (also 0.5.0-rc.14), which the frontend uses. The push-notifications feature
+# must stay enabled for FCM receiving to be compiled in.
+tauri-plugin-notifications = { version = "=0.5.0-rc.14", features = ["push-notifications"] }
+
 [build-dependencies]
 tauri-build = { version = "2" }

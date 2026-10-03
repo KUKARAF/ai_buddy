@@ -18,6 +18,13 @@ pub fn run() {
         // "deep-link:default" / "opener:default" in capabilities/default.json.
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
+        // FCM push RECEIVING (Choochmeque notifications fork, push-notifications
+        // feature). Registers the notification/push commands the frontend calls
+        // (registerForPushNotifications -> FCM device token, onNotificationReceived,
+        // etc.). Needs Firebase wiring in the APK: google-services.json + the
+        // Google Services Gradle plugin, injected in CI. Permissions:
+        // "notifications:default" in capabilities/default.json.
+        .plugin(tauri_plugin_notifications::init())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

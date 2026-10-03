@@ -5,6 +5,7 @@ mod circles;
 mod config;
 mod db;
 mod error;
+mod fcm;
 mod goals;
 mod holidays;
 mod llm;

@@ -136,9 +136,44 @@ async fn deliver(pool: &SqlitePool, reminder: &ReminderRow) -> anyhow::Result<()
     Ok(())
 }
 
+/// Derive a user-facing push title + body from a reminder's `kind` and parsed
+/// `payload`. Pure (no I/O) so it is unit-testable. Prefers explicit
+/// `title`/`body` fields in the payload, falling back to a `kind`-based title and
+/// a `message`/`text` body.
+fn reminder_push_text(kind: &str, payload: &serde_json::Value) -> (String, String) {
+    let title = payload
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| match kind {
+            "tip" => "A tip for you".to_string(),
+            "checkin" => "Time to check in".to_string(),
+            "reminder" => "Reminder".to_string(),
+            "coach" => "Coach update".to_string(),
+            other if !other.is_empty() => {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => "Reminder".to_string(),
+                }
+            }
+            _ => "Reminder".to_string(),
+        });
+
+    let body = payload
+        .get("body")
+        .or_else(|| payload.get("message"))
+        .or_else(|| payload.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    (title, body)
+}
+
 /// One scheduler pass: find due reminders and deliver each. A failure delivering
 /// one reminder is logged and does not abort the rest of the batch.
-async fn run_tick(pool: &SqlitePool, _state: &AppState) -> anyhow::Result<()> {
+async fn run_tick(pool: &SqlitePool, state: &AppState) -> anyhow::Result<()> {
     let now = now_rfc3339()?;
     let due = poll_due(pool, &now).await?;
     if due.is_empty() {
@@ -148,12 +183,28 @@ async fn run_tick(pool: &SqlitePool, _state: &AppState) -> anyhow::Result<()> {
 
     for reminder in &due {
         // TODO(llm-tip): for `kind == "tip"` (ReminderKind::Tip) this is where an
-        // LLM-generated, personalized tip could be produced via `_state.llm` and
+        // LLM-generated, personalized tip could be produced via `state.llm` and
         // merged into the payload before delivery. Deliberately NOT called here —
         // the scheduler stays self-contained and non-blocking for the MVP.
         if let Err(e) = deliver(pool, reminder).await {
             tracing::error!(error = ?e, reminder_id = %reminder.id, "notify: delivery failed");
+            continue;
         }
+
+        // Best-effort mobile push for the just-delivered reminder (no-op when FCM
+        // is unconfigured; never affects delivery/sent_at stamping above).
+        let payload: serde_json::Value =
+            serde_json::from_str(&reminder.payload).unwrap_or_else(|_| serde_json::json!({}));
+        let (title, body) = reminder_push_text(&reminder.kind, &payload);
+        crate::fcm::send_to_user(
+            pool,
+            &state.config,
+            &reminder.user_id,
+            &title,
+            &body,
+            Some(payload),
+        )
+        .await;
     }
     Ok(())
 }
@@ -370,6 +421,32 @@ mod tests {
 
     const PAST: &str = "2000-01-01T00:00:00Z";
     const FUTURE: &str = "2999-01-01T00:00:00Z";
+
+    #[test]
+    fn reminder_push_text_prefers_payload_fields() {
+        let payload = serde_json::json!({ "title": "Custom", "body": "Do the thing" });
+        let (title, body) = reminder_push_text("reminder", &payload);
+        assert_eq!(title, "Custom");
+        assert_eq!(body, "Do the thing");
+    }
+
+    #[test]
+    fn reminder_push_text_falls_back_to_kind_and_message() {
+        // No title => kind-based title; body falls back to `message` then `text`.
+        let (title, body) = reminder_push_text("tip", &serde_json::json!({ "message": "stretch" }));
+        assert_eq!(title, "A tip for you");
+        assert_eq!(body, "stretch");
+
+        let (title, body) =
+            reminder_push_text("checkin", &serde_json::json!({ "text": "how's it going" }));
+        assert_eq!(title, "Time to check in");
+        assert_eq!(body, "how's it going");
+
+        // Unknown kind => capitalized kind, empty body when nothing usable.
+        let (title, body) = reminder_push_text("weekly", &serde_json::json!({}));
+        assert_eq!(title, "Weekly");
+        assert_eq!(body, "");
+    }
 
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().unwrap();

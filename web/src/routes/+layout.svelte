@@ -11,6 +11,7 @@
 	import { coach } from '$lib/coachState.svelte';
 	import { IS_APP } from '$lib/api/deviceToken';
 	import { startLogin } from '$lib/app/login';
+	import { registerPushIfTauri } from '$lib/app/pushRegister';
 
 	let { children } = $props();
 
@@ -32,7 +33,13 @@
 			await app.ensureLoaded();
 			// Hydrate the notifications bell once auth is known (client-side only;
 			// onMount never runs on the server). Guests resolve to an empty list.
-			if (!app.isGuest) void notifications.refresh();
+			if (!app.isGuest) {
+				void notifications.refresh();
+				// App build only: register this device's FCM push token with the
+				// backend so it can receive push. No-op (returns immediately) on the
+				// website build and in a plain browser; never throws.
+				void registerPushIfTauri();
+			}
 		})();
 
 		return () => unlistenDeepLink?.();

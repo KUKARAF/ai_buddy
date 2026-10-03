@@ -68,6 +68,15 @@ pub struct Config {
     /// IP-to-Country Lite or GeoLite2 Country `.mmdb`). `None` (unset/empty)
     /// disables the optional country pre-fill. The client IP is never persisted.
     pub geoip_db_path: Option<String>,
+
+    // --- Push (Firebase Cloud Messaging, HTTP v1) ---
+    /// FCM / Firebase project id (e.g. `ai-buddy-4063c`), from
+    /// `AIBUDDY_FCM_PROJECT_ID`. `None` when unset/empty. Server-side push is
+    /// enabled only when this AND [`Self::fcm_credentials`] are both set.
+    pub fcm_project_id: Option<String>,
+    /// Filesystem path to the Google service-account JSON key used to mint FCM
+    /// OAuth tokens, from `AIBUDDY_FCM_CREDENTIALS`. `None` when unset/empty.
+    pub fcm_credentials: Option<String>,
 }
 
 /// User id used for every request when [`Config::dev_mode`] is enabled.
@@ -200,6 +209,13 @@ impl Config {
             mcp_audience,
 
             geoip_db_path: std::env::var("AIBUDDY_GEOIP_DB")
+                .ok()
+                .filter(|s| !s.is_empty()),
+
+            fcm_project_id: std::env::var("AIBUDDY_FCM_PROJECT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            fcm_credentials: std::env::var("AIBUDDY_FCM_CREDENTIALS")
                 .ok()
                 .filter(|s| !s.is_empty()),
         }

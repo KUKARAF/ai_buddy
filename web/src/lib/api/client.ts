@@ -806,6 +806,21 @@ export async function markAllNotificationsRead(options?: RequestOptions): Promis
 	await request<void>('POST', '/api/notifications/read-all', {}, options);
 }
 
+/**
+ * POST /api/push-tokens — register (upsert) this device's push token so the
+ * backend can deliver push notifications to it. `platform` is the device
+ * platform ("android" | "ios" | "web") and `token` the platform push token
+ * (FCM token on Android). Idempotent server-side (upsert). App build only:
+ * see `$lib/app/pushRegister`, which only calls this inside the Tauri runtime.
+ */
+export async function upsertPushToken(
+	platform: string,
+	token: string,
+	options?: RequestOptions
+): Promise<void> {
+	await request<void>('POST', '/api/push-tokens', { platform, token }, options);
+}
+
 // --- Circles ------------------------------------------------------------------
 
 /**

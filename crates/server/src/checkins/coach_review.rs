@@ -475,11 +475,30 @@ async fn try_coach_review(
                 serde_json::Value::String(goal.title.clone()),
             );
         }
-        if let Err(e) = notifier
+        match notifier
             .post_now(user_id, Some(goal_id), None, COACH_KIND, payload)
             .await
         {
-            tracing::warn!(error = ?e, goal_id, "coach notification post failed (ignored)");
+            Ok(_) => {
+                // Best-effort mobile push of the same coach message (no-op when
+                // FCM is unconfigured; never affects the check-in).
+                let push_data = serde_json::json!({
+                    "goal_id": goal_id,
+                    "status": review.status.clone(),
+                });
+                crate::fcm::send_to_user(
+                    pool,
+                    config,
+                    user_id,
+                    &review.headline,
+                    &review.message,
+                    Some(push_data),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, goal_id, "coach notification post failed (ignored)");
+            }
         }
     }
 
