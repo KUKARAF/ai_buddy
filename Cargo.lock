@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "ai-buddy-core"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "rand 0.10.3",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "mobile"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "ai-buddy-core",
  "serde_json",
@@ -4509,7 +4509,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "ai-buddy-core",
  "anyhow",
