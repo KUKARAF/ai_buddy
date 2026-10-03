@@ -196,6 +196,12 @@ export interface Todo {
 	ord: number;
 	title: string;
 	done: boolean;
+	/**
+	 * What kind of to-do this is: 'training' lives under a milestone, while
+	 * 'gear' | 'logistics' | 'prep' | 'other' are goal-level (gear/prep/logistics)
+	 * shown in the goal's "Gear & logistics" section.
+	 */
+	category: string;
 	created_at: string;
 	/** When it was ticked off, or null while still open. */
 	done_at: string | null;
@@ -474,6 +480,20 @@ export function getStepTodos(stepId: string, options?: RequestOptions): Promise<
 }
 
 /**
+ * GET /api/goals/:id/todos — the goal's NON-training to-dos (gear / logistics /
+ * prep / other), in order. These are added by the coach from check-ins and shown
+ * in the goal's "Gear & logistics" section. Resolves to an empty array when none.
+ */
+export function getGoalTodos(goalId: string, options?: RequestOptions): Promise<Todo[]> {
+	return request<Todo[]>(
+		'GET',
+		`/api/goals/${encodeURIComponent(goalId)}/todos`,
+		undefined,
+		options
+	);
+}
+
+/**
  * POST /api/steps/:id/todos/generate — ask the coach (LLM) to generate this
  * step's TODO list. Idempotent: returns the existing list if already generated.
  *
@@ -505,6 +525,11 @@ export interface GoalCheckInResponse extends CheckIn {
 	suggestion: { adjust: boolean; message: string | null };
 	/** TODOs auto-ticked from this check-in's note (empty when none matched). */
 	todos_completed: Todo[];
+	/**
+	 * New to-dos the coach added from this check-in's note (e.g. gear/logistics the
+	 * note surfaced). Can be training (milestone) or goal-level; empty when none.
+	 */
+	todos_added: Todo[];
 }
 
 /** POST /api/goals/:id/check-ins — log a check-in against a goal. */

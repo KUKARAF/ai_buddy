@@ -26,6 +26,7 @@
 		getWallet,
 		getSimilar,
 		getStepTodos,
+		getGoalTodos,
 		generateStepTodos,
 		toggleTodo,
 		ApiError,
@@ -66,6 +67,10 @@
 	type TodoState = 'generating' | 'generated' | 'topup' | 'error';
 	let todoGenState = $state<Record<string, TodoState>>({});
 	const togglingTodo: Record<string, true> = {};
+
+	// --- Goal-level (non-training) TODOs: gear / logistics / prep / other -------
+	// Added by the coach from check-ins; shown in the "Gear & logistics" section.
+	let goalTodos = $state<Todo[]>([]);
 	// Brief confirmation after a check-in auto-ticks some TODOs.
 	let tickedConfirm = $state<string | null>(null);
 	let tickedTimer: ReturnType<typeof setTimeout> | null = null;
@@ -139,6 +144,9 @@
 		void getSimilar(goalId)
 			.then((s) => (similar = s))
 			.catch(() => (similar = null));
+		void getGoalTodos(goalId)
+			.then((t) => (goalTodos = t))
+			.catch(() => (goalTodos = []));
 	});
 
 	// Real count of other users with a similar goal (0 = honest normal case).
@@ -248,6 +256,37 @@
 		}
 	}
 
+	// Toggle a goal-level (non-training) TODO with the same optimistic pattern.
+	async function toggleGoalTodo(todo: Todo): Promise<void> {
+		if (togglingTodo[todo.id]) return;
+		togglingTodo[todo.id] = true;
+		const next = !todo.done;
+		goalTodos = goalTodos.map((t) => (t.id === todo.id ? { ...t, done: next } : t));
+		try {
+			const updated = await toggleTodo(todo.id, next);
+			goalTodos = goalTodos.map((t) => (t.id === todo.id ? updated : t));
+		} catch {
+			// Revert to the original on failure.
+			goalTodos = goalTodos.map((t) => (t.id === todo.id ? { ...t, done: todo.done } : t));
+		} finally {
+			delete togglingTodo[todo.id];
+		}
+	}
+
+	// Small badge (emoji + label) for a goal-level TODO's category.
+	function todoBadge(category: string): { icon: string; label: string } {
+		switch (category) {
+			case 'gear':
+				return { icon: '🛠', label: 'Gear' };
+			case 'logistics':
+				return { icon: '📦', label: 'Logistics' };
+			case 'prep':
+				return { icon: '📋', label: 'Prep' };
+			default:
+				return { icon: '•', label: 'Other' };
+		}
+	}
+
 	// Lazily generate the current milestone's TODOs the first time its plan is
 	// shown. Gated on the plan tab so we never spend on a milestone the user
 	// isn't looking at; guarded so it runs at most once per step.
@@ -318,19 +357,30 @@
 			checkinSubmitting = false;
 			return;
 		}
-		// The check-in note may have auto-ticked some of the current milestone's
-		// TODOs server-side: refetch them so the ticks show, and confirm briefly.
-		// We leave milestone-completion to the user's explicit tap.
-		if (created.todos_completed?.length) {
-			tickedConfirm = `✓ Ticked off: ${created.todos_completed.map((t) => t.title).join(', ')}`;
+		// The check-in note may have changed to-dos server-side: it can auto-tick
+		// some of the current milestone's TODOs, and/or add new gear/logistics/prep
+		// to-dos. Refetch the affected lists so the UI reflects them, and confirm
+		// briefly. We leave milestone-completion to the user's explicit tap.
+		const ticked = created.todos_completed ?? [];
+		const added = created.todos_added ?? [];
+		if (ticked.length || added.length) {
+			const lines: string[] = [];
+			if (ticked.length) lines.push(`✓ Ticked off: ${ticked.map((t) => t.title).join(', ')}`);
+			if (added.length) lines.push(`➕ Added: ${added.map((t) => t.title).join(', ')}`);
+			tickedConfirm = lines.join('\n');
 			if (tickedTimer !== null) clearTimeout(tickedTimer);
 			tickedTimer = setTimeout(() => (tickedConfirm = null), 6000);
+			// Refetch the current milestone's training to-dos (ticks + any new ones).
 			const cs = currentStep;
 			if (cs) {
 				void getStepTodos(cs.id)
 					.then((ts) => (todosByStep = { ...todosByStep, [cs.id]: ts }))
 					.catch(() => {});
 			}
+			// Refetch the goal-level (gear/logistics/prep/other) to-dos.
+			void getGoalTodos(goalId)
+				.then((t) => (goalTodos = t))
+				.catch(() => {});
 		}
 		// Photo is best-effort: the check-in already succeeded above.
 		const file = photoFile;
@@ -898,6 +948,37 @@
 									</button>
 								{/if}
 							</div>
+						{/if}
+
+						{#if goalTodos.length > 0}
+							<section class="card gear-card" aria-label="Gear and logistics">
+								<p class="eyebrow">Gear &amp; logistics</p>
+								<p class="muted small gear-sub">
+									Prep and kit your coach spotted from your check-ins.
+								</p>
+								<ul class="todo-list gear-list">
+									{#each goalTodos as todo (todo.id)}
+										{@const badge = todoBadge(todo.category)}
+										<li class="todo-item" class:done={todo.done}>
+											<label class="todo-row">
+												<input
+													type="checkbox"
+													class="todo-check"
+													checked={todo.done}
+													disabled={!!togglingTodo[todo.id]}
+													onchange={() => toggleGoalTodo(todo)}
+													aria-label={todo.title}
+												/>
+												<span class="todo-text">{todo.title}</span>
+												<span class="todo-badge badge-{todo.category}">
+													{badge.icon}
+													{badge.label}
+												</span>
+											</label>
+										</li>
+									{/each}
+								</ul>
+							</section>
 						{/if}
 					</section>
 				{:else if tab === 'checkins'}
@@ -1483,6 +1564,47 @@
 		text-decoration: line-through;
 		color: var(--muted);
 	}
+
+	/* goal-level "Gear & logistics" section */
+	.gear-card {
+		padding: 18px;
+		margin-top: 16px;
+	}
+	.gear-sub {
+		margin: 4px 0 12px;
+	}
+	.gear-list .todo-row {
+		align-items: center;
+	}
+	.gear-list .todo-text {
+		flex: 1;
+		min-width: 0;
+	}
+	.todo-badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		flex: none;
+		background: var(--tag-bg);
+		color: var(--muted);
+		border-radius: 999px;
+		padding: 2px 9px;
+		font-size: 11px;
+		font-weight: 600;
+		white-space: nowrap;
+	}
+	.todo-badge.badge-gear {
+		background: color-mix(in srgb, var(--sky) 35%, var(--card));
+		color: var(--sky-ink);
+	}
+	.todo-badge.badge-logistics {
+		background: color-mix(in srgb, var(--sage) 40%, var(--card));
+		color: var(--sage-ink);
+	}
+	.todo-badge.badge-prep {
+		background: color-mix(in srgb, var(--lavender) 45%, var(--card));
+		color: var(--lavender-ink);
+	}
 	.planning {
 		display: flex;
 		align-items: center;
@@ -1534,6 +1656,8 @@
 		padding: 11px 16px;
 		border-radius: 999px;
 		box-shadow: var(--shadow);
+		white-space: pre-line;
+		text-align: center;
 	}
 
 	.ci-head {

@@ -81,15 +81,19 @@ impl Suggestion {
 }
 
 /// The goal-scoped check-in response: the stored row plus a coach `suggestion`
-/// and any milestone todos this check-in auto-ticked (empty in the common case).
+/// and the milestone todos this check-in touched (both empty in the common case).
 #[derive(Debug, Serialize)]
 struct GoalCheckInResponse {
     #[serde(flatten)]
     check_in: CheckIn,
     suggestion: Suggestion,
     /// Todos newly marked done by THIS check-in's note (see
-    /// [`crate::todos::complete_todos_from_note`]). Empty normally.
+    /// [`crate::todos::process_todos_from_note`]). Empty normally.
     todos_completed: Vec<crate::todos::TodoView>,
+    /// New todos the note implied and this check-in added — training items under
+    /// the current milestone, gear/logistics/prep/other at the goal level. Empty
+    /// normally.
+    todos_added: Vec<crate::todos::TodoView>,
 }
 
 /// The model's verdict, parsed from the classifier's JSON output. Fields default
@@ -365,9 +369,10 @@ async fn create_goal_checkin(
     )
     .await;
 
-    // Best-effort auto-tick of the current milestone's pending todos from the
-    // note. This never fails the check-in: any error yields an empty list.
-    let todos_completed = crate::todos::complete_todos_from_note(
+    // Best-effort processing of the current milestone's todos from the note: both
+    // completing pending items and adding new ones the note implies. This never
+    // fails the check-in: any error yields empty lists.
+    let todo_result = crate::todos::process_todos_from_note(
         &state.llm,
         &state.db,
         &state.config,
@@ -380,7 +385,8 @@ async fn create_goal_checkin(
     Ok(Json(GoalCheckInResponse {
         check_in,
         suggestion,
-        todos_completed,
+        todos_completed: todo_result.completed,
+        todos_added: todo_result.added,
     }))
 }
 
