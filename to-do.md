@@ -17,9 +17,21 @@ In-app delivery is already live; this file is mostly about **push-to-closed-app*
 
 ---
 
-## 🟢 Claude can do alone (no external accounts)
-Server + client code, CI, deploy. These can be built/feature-flagged **before** credentials exist
-(they stay inert until the secrets below are present).
+## 🟢 Claude can do alone — ✅ DONE & DEPLOYED (2026-10-03, commit 9605978)
+All built, gated, shipped. Server-side FCM is now ACTIVE in prod (credential mounted at
+`/secrets/fcm.json`, `AIBUDDY_FCM_PROJECT_ID` + `AIBUDDY_FCM_CREDENTIALS` set, health 200).
+The Firebase-injected nightly APK built successfully and is on the GitHub nightly release.
+
+- [x] Server FCM send (`crates/server/src/fcm/mod.rs`): data-only HTTP v1, OAuth via jsonwebtoken (no new dep; enabled `use_pem`), stale-token pruning. Hooked into the coach flow + reminder scheduler, best-effort.
+- [x] Config `AIBUDDY_FCM_PROJECT_ID` + `AIBUDDY_FCM_CREDENTIALS`; credential bind-mounted in the prod compose.
+- [x] Tauri push plugin `tauri-plugin-notifications` =0.5.0-rc.14 (push-notifications feature) + capabilities.
+- [x] CI injection of `google-services.json` (secret `GOOGLE_SERVICES_JSON_B64`) + Google Services gradle plugin in android-nightly.yml + android-release.yml (fail-loud on template drift).
+- [x] Frontend `registerPushIfTauri()` → `POST /api/push-tokens` on login (Tauri-guarded).
+
+### 🔴 Only remaining step — you
+- [ ] Install the latest **nightly APK** (from GitHub Releases) and **grant notification permission** → then a check-in triggers a coach push to your phone.
+
+### (original plan, for reference)
 
 ### Server (Rust)
 - [ ] FCM HTTP v1 **send** in `notify::deliver()` + from the coach `post_now` path: mint an OAuth token from the service account (`gcp_auth`) and `POST fcm.googleapis.com/v1/projects/{id}/messages:send` via `reqwest`.
