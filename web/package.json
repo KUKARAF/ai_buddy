@@ -32,6 +32,8 @@
 	},
 	"dependencies": {
 		"@tauri-apps/plugin-deep-link": "^2.4.9",
-		"@tauri-apps/plugin-opener": "^2.5.4"
+		"@tauri-apps/plugin-opener": "^2.5.4",
+		"dompurify": "^3.4.16",
+		"marked": "^18.0.14"
 	}
 }

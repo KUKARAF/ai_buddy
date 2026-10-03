@@ -467,10 +467,37 @@ export function createGoalCheckIn(
 }
 
 /**
+ * A structured, presentational preview of the changes the coach is proposing in
+ * an {@link AdjustReply}. Purely for display — the existing "reply 'yes' to
+ * apply" confirm flow is what actually applies them.
+ */
+export interface AdjustProposal {
+	/** One-line human summary of the proposed change. */
+	summary: string;
+	/** Breaks the coach would add (dates are YYYY-MM-DD). */
+	add_breaks: { label: string; start_date: string; end_date: string }[];
+	/** Human labels of breaks the coach would remove. */
+	remove_breaks: string[];
+	/** Milestone date moves; `old_due`/`new_due` are YYYY-MM-DD or null. */
+	milestone_changes: { title: string; old_due: string | null; new_due: string | null }[];
+}
+
+/** The reply from an "adjust my plan" coach turn (POST /api/goals/:id/adjust). */
+export interface AdjustReply {
+	/** The coach's assistant message for this turn. */
+	reply: string;
+	/** True only when the coach actually altered the plan this turn. */
+	changed: boolean;
+	/** A structured preview of the proposed change, when the coach has one. */
+	proposal?: AdjustProposal | null;
+}
+
+/**
  * POST /api/goals/:id/adjust — one agentic, NON-streaming coach turn that can
  * change the plan's timeline/breaks (propose-then-confirm). The turn may take a
  * few seconds; `changed` is true only when the coach actually altered the plan,
- * in which case callers should re-fetch the roadmap.
+ * in which case callers should re-fetch the roadmap. When the coach is proposing
+ * (not yet applying) a change, `proposal` carries a structured preview.
  *
  * Can throw {@link ApiError} with `.status === 402` (wallet empty) or
  * `.status === 400` (coach unavailable); callers surface those gently.
@@ -479,8 +506,8 @@ export function adjustPlan(
 	goalId: string,
 	content: string,
 	options?: RequestOptions
-): Promise<{ reply: string; changed: boolean }> {
-	return request<{ reply: string; changed: boolean }>(
+): Promise<AdjustReply> {
+	return request<AdjustReply>(
 		'POST',
 		`/api/goals/${encodeURIComponent(goalId)}/adjust`,
 		{ content },

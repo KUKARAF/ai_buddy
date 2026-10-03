@@ -11,6 +11,7 @@ mod llm;
 mod mcp;
 mod notify;
 mod routes;
+mod security;
 mod settings;
 mod state;
 mod vector;
@@ -125,7 +126,12 @@ async fn main() -> anyhow::Result<()> {
     // Background reminder/tip scheduler.
     notifier.spawn_scheduler(state.clone());
 
-    let app = routes::build(state).layer(session_layer).layer(cors);
+    // Outermost layer: defense-in-depth security headers (CSP, nosniff, etc.) on
+    // EVERY response — REST API, MCP mount, and the static SPA fallback alike.
+    let app = routes::build(state)
+        .layer(session_layer)
+        .layer(cors)
+        .layer(axum::middleware::from_fn(security::set_security_headers));
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("listening on {}", listener.local_addr()?);

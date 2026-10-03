@@ -10,11 +10,22 @@
 		<meta name="referrer" content="strict-origin-when-cross-origin" />
 
 		<!--
-			Content-Security-Policy is intentionally NOT set as a <meta http-equiv>:
-			the SvelteKit static build emits an inline bootstrap <script> with no
-			nonce, and connect-src must allow the (build-time-unknown) backend
-			origin from PUBLIC_API_BASE_URL. Set the CSP and other security headers
-			at the reverse proxy / static host instead.
+			Content-Security-Policy is intentionally NOT set as a <meta http-equiv>
+			here. The Rust server now sets the CSP (and X-Content-Type-Options,
+			Referrer-Policy, X-Frame-Options, Permissions-Policy) on EVERY response
+			— including this static SPA shell — via a response-header middleware
+			(see crates/server/src/security.rs). The Tauri APK build sets its own
+			CSP in crates/mobile/tauri.conf.json (its connect-src also allows the
+			remote backend origin).
+
+			Why it is not a <meta> tag: the SvelteKit static build emits an inline
+			bootstrap <script> with no nonce, and connect-src must allow the
+			(build-time-unknown) backend origin from PUBLIC_API_BASE_URL. The server
+			policy therefore uses `script-src 'self' 'unsafe-inline'` as a pragmatic
+			compromise: it still blocks all REMOTE script loads.
+
+			TODO (future hardening): emit a nonce or hash for the inline bootstrap
+			script and drop 'unsafe-inline' from script-src.
 		-->
 
 		%sveltekit.head%

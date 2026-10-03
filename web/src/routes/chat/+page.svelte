@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
+	import Markdown from '$lib/components/Markdown.svelte';
 	import {
 		createConversation,
 		getConversation,
@@ -177,7 +178,7 @@
 					<div class="row assistant">
 						<span class="av"><Icon name="check" size={14} stroke={2.6} /></span>
 						<div class="a-col">
-							<div class="bubble a-bubble">{message.content}</div>
+							<div class="bubble a-bubble"><Markdown source={message.content} /></div>
 							{#if message.createdGoalId}
 								<div class="goal-created">
 									<span class="gc-check"><Icon name="check" size={14} stroke={2.6} /></span>

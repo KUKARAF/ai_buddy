@@ -1113,6 +1113,38 @@ struct AdjustRequest {
 struct AdjustReply {
     reply: String,
     changed: bool,
+    /// A structured DRY-RUN preview of a proposed plan change, emitted at PROPOSE
+    /// time so the UI can render a before/after card BEFORE the user confirms.
+    /// `None` on confirm/apply turns and when the model proposes nothing.
+    /// Serialized as JSON `null` (not skipped) — the frontend expects the key.
+    proposal: Option<ProposalView>,
+}
+
+/// Structured, DRY-RUN view of a proposed plan change for the before/after card.
+/// Populated from a `preview_adjustment` tool call; persists nothing.
+#[derive(Debug, Serialize)]
+struct ProposalView {
+    summary: String,
+    add_breaks: Vec<ProposedBreak>,
+    /// Human-readable labels of existing breaks the proposal would remove.
+    remove_breaks: Vec<String>,
+    milestone_changes: Vec<MilestoneChange>,
+}
+
+/// A break the proposal would add. Dates are `YYYY-MM-DD`.
+#[derive(Debug, Serialize)]
+struct ProposedBreak {
+    label: String,
+    start_date: String,
+    end_date: String,
+}
+
+/// A single milestone whose due date would change. `None` = none / unknown.
+#[derive(Debug, Serialize)]
+struct MilestoneChange {
+    title: String,
+    old_due: Option<String>,
+    new_due: Option<String>,
 }
 
 /// Title of the goal-scoped conversation that stores plan-adjustment history.
@@ -1131,7 +1163,11 @@ reschedule or restructure the milestones so that no milestone due-date falls ins
 the plan still reaches the goal by its deadline. Do NOT invent breaks the user did not mention. \
 Call the tools (add_break, remove_break, update_milestones) ONLY AFTER the user has explicitly \
 confirmed your proposal in the conversation — never before, and never in the same reply as the \
-proposal. When the user asks you to AVOID scheduling during a period or holiday (e.g. \"take the \
+proposal. WHEN PROPOSING a change (before the user confirms), call the preview_adjustment tool with \
+the complete structured diff (summary, add_breaks, remove_breaks by label, and milestone_changes with \
+old and new dates) AND write your warm one-paragraph message describing it — preview_adjustment is a \
+DRY RUN that changes nothing, so it does not count as applying; you must still wait for explicit \
+confirmation before calling the apply tools. When the user asks you to AVOID scheduling during a period or holiday (e.g. \"take the \
 holidays into account\", \"don't set any deadlines around Christmas\", \"keep December clear\"), \
 treat that period as off-limits: propose adding a break (add_break) covering it AND rescheduling \
 the milestones (update_milestones) so that NO milestone due_date falls inside ANY break — existing \
@@ -1194,6 +1230,53 @@ fn adjust_system_prompt(
 /// array. All are called only AFTER the user confirms (enforced by the prompt).
 fn adjust_tools() -> serde_json::Value {
     serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "preview_adjustment",
+                "description": "Call this to PREVIEW a proposed plan change to the user BEFORE they \
+    confirm. It does NOT modify anything. After the user confirms, call the real add_break/remove_break/\
+    update_milestones tools to apply. Provide the COMPLETE structured diff of what you are proposing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string", "description": "One short sentence describing the proposed change." },
+                        "add_breaks": {
+                            "type": "array",
+                            "description": "Breaks the proposal would add.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string", "description": "Short label, e.g. 'Christmas'." },
+                                    "start_date": { "type": "string", "description": "First unavailable day, YYYY-MM-DD." },
+                                    "end_date": { "type": "string", "description": "Last unavailable day, YYYY-MM-DD." }
+                                },
+                                "required": ["label", "start_date", "end_date"]
+                            }
+                        },
+                        "remove_breaks": {
+                            "type": "array",
+                            "description": "Labels of EXISTING breaks the proposal would remove.",
+                            "items": { "type": "string" }
+                        },
+                        "milestone_changes": {
+                            "type": "array",
+                            "description": "The COMPLETE set of milestones that change, with their current and proposed dates.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string", "description": "Milestone title." },
+                                    "old_due": { "type": ["string", "null"], "description": "Current due date, YYYY-MM-DD, or null." },
+                                    "new_due": { "type": ["string", "null"], "description": "Proposed due date, YYYY-MM-DD, or null." }
+                                },
+                                "required": ["title"]
+                            }
+                        }
+                    },
+                    "required": ["summary"]
+                }
+            }
+        },
         {
             "type": "function",
             "function": {
@@ -1272,6 +1355,61 @@ struct RemoveBreakArgs {
 struct UpdateMilestonesArgs {
     #[serde(default)]
     milestones: Vec<NewMilestone>,
+}
+
+/// Arguments for the DRY-RUN `preview_adjustment` tool. Mirrors [`ProposalView`].
+#[derive(Debug, Deserialize)]
+struct PreviewAdjustmentArgs {
+    summary: String,
+    #[serde(default)]
+    add_breaks: Vec<PreviewBreakArg>,
+    #[serde(default)]
+    remove_breaks: Vec<String>,
+    #[serde(default)]
+    milestone_changes: Vec<PreviewMilestoneChangeArg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewBreakArg {
+    label: String,
+    start_date: String,
+    end_date: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewMilestoneChangeArg {
+    title: String,
+    #[serde(default)]
+    old_due: Option<String>,
+    #[serde(default)]
+    new_due: Option<String>,
+}
+
+impl From<PreviewAdjustmentArgs> for ProposalView {
+    fn from(a: PreviewAdjustmentArgs) -> Self {
+        ProposalView {
+            summary: a.summary,
+            add_breaks: a
+                .add_breaks
+                .into_iter()
+                .map(|b| ProposedBreak {
+                    label: b.label,
+                    start_date: b.start_date,
+                    end_date: b.end_date,
+                })
+                .collect(),
+            remove_breaks: a.remove_breaks,
+            milestone_changes: a
+                .milestone_changes
+                .into_iter()
+                .map(|m| MilestoneChange {
+                    title: m.title,
+                    old_due: m.old_due,
+                    new_due: m.new_due,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Sanitize milestones from a tool call: trim titles/efforts, drop malformed
@@ -1446,6 +1584,7 @@ async fn adjust_plan(
 
     let mut total_cost: i64 = 0;
     let mut changed = false;
+    let mut proposal: Option<ProposalView> = None;
     let mut reply: Option<String> = None;
 
     for _ in 0..4 {
@@ -1484,6 +1623,20 @@ async fn adjust_plan(
 
         for tc in &turn.tool_calls {
             let result = match tc.name.as_str() {
+                "preview_adjustment" => {
+                    match serde_json::from_str::<PreviewAdjustmentArgs>(&tc.arguments) {
+                        Ok(args) => {
+                            // DRY-RUN: record the structured diff for the UI; persist
+                            // nothing and do NOT set `changed`.
+                            proposal = Some(ProposalView::from(args));
+                            serde_json::json!({ "ok": true, "previewed": true })
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = ?e, "preview_adjustment arguments invalid");
+                            serde_json::json!({ "ok": false, "error": "invalid arguments" })
+                        }
+                    }
+                }
                 "add_break" => match serde_json::from_str::<AddBreakArgs>(&tc.arguments) {
                     Ok(args) => {
                         match add_break(
@@ -1574,7 +1727,11 @@ async fn adjust_plan(
     }
     insert_adjust_message(&state.db, &conv_id, "assistant", &reply, total_cost).await?;
 
-    Ok(Json(AdjustReply { reply, changed }))
+    Ok(Json(AdjustReply {
+        reply,
+        changed,
+        proposal,
+    }))
 }
 
 #[cfg(test)]
@@ -1618,6 +1775,83 @@ mod tests {
         assert!(!valid_ymd("2026-13-01")); // bad month
         assert!(!valid_ymd("2026-12-40")); // bad day
         assert!(!valid_ymd("26-9-1")); // wrong widths
+    }
+
+    #[test]
+    fn preview_adjustment_args_map_to_proposal_view() {
+        let raw = r#"{
+            "summary": "Shift the plan around your Christmas break.",
+            "add_breaks": [
+                { "label": "Christmas", "start_date": "2026-12-24", "end_date": "2026-12-26" }
+            ],
+            "remove_breaks": ["Old placeholder"],
+            "milestone_changes": [
+                { "title": "Finish chapter 3", "old_due": "2026-12-25", "new_due": "2026-12-29" }
+            ]
+        }"#;
+
+        let args: PreviewAdjustmentArgs =
+            serde_json::from_str(raw).expect("parse preview_adjustment args");
+        let view = ProposalView::from(args);
+
+        assert_eq!(view.summary, "Shift the plan around your Christmas break.");
+
+        assert_eq!(view.add_breaks.len(), 1);
+        let brk = view.add_breaks.first().expect("one add_break");
+        assert_eq!(brk.label, "Christmas");
+        assert_eq!(brk.start_date, "2026-12-24");
+        assert_eq!(brk.end_date, "2026-12-26");
+
+        assert_eq!(view.remove_breaks, vec!["Old placeholder".to_string()]);
+
+        assert_eq!(view.milestone_changes.len(), 1);
+        let mc = view
+            .milestone_changes
+            .first()
+            .expect("one milestone change");
+        assert_eq!(mc.title, "Finish chapter 3");
+        assert_eq!(mc.old_due.as_deref(), Some("2026-12-25"));
+        assert_eq!(mc.new_due.as_deref(), Some("2026-12-29"));
+    }
+
+    #[test]
+    fn preview_adjustment_args_allow_missing_and_null_fields() {
+        // Only `summary` is required; absent arrays default empty and null dates
+        // deserialize to None.
+        let raw = r#"{
+            "summary": "Just rename a milestone.",
+            "milestone_changes": [
+                { "title": "Draft intro", "old_due": null, "new_due": null }
+            ]
+        }"#;
+
+        let args: PreviewAdjustmentArgs =
+            serde_json::from_str(raw).expect("parse sparse preview args");
+        let view = ProposalView::from(args);
+
+        assert!(view.add_breaks.is_empty());
+        assert!(view.remove_breaks.is_empty());
+        assert_eq!(view.milestone_changes.len(), 1);
+        let mc = view
+            .milestone_changes
+            .first()
+            .expect("one milestone change");
+        assert_eq!(mc.old_due, None);
+        assert_eq!(mc.new_due, None);
+    }
+
+    #[test]
+    fn adjust_reply_serializes_proposal_key_even_when_none() {
+        let reply = AdjustReply {
+            reply: "ok".to_string(),
+            changed: false,
+            proposal: None,
+        };
+        let v = serde_json::to_value(&reply).expect("serialize AdjustReply");
+        // The frontend expects the key to always be present (null when absent).
+        assert!(v.get("proposal").is_some());
+        assert!(v["proposal"].is_null());
+        assert_eq!(v["changed"], serde_json::Value::Bool(false));
     }
 
     #[test]

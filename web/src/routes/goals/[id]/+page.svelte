@@ -4,6 +4,7 @@
 	import { resolve } from '$app/paths';
 	import { goto } from '$app/navigation';
 	import Icon from '$lib/components/Icon.svelte';
+	import Markdown from '$lib/components/Markdown.svelte';
 	import { app } from '$lib/appState.svelte';
 	import { shortDate, relativeDate, euros } from '$lib/format';
 	import { goalLook } from '$lib/goalView';
@@ -30,7 +31,8 @@
 		type Break,
 		type CheckIn,
 		type Pledge,
-		type SimilarGoals
+		type SimilarGoals,
+		type AdjustProposal
 	} from '$lib/api/client';
 
 	const goalId = page.params.id ?? '';
@@ -70,6 +72,8 @@
 		id: string;
 		role: 'user' | 'assistant';
 		content: string;
+		/** Structured preview of the coach's proposed change (assistant turns only). */
+		proposal?: AdjustProposal | null;
 	}
 	let adjustOpen = $state(false);
 	let adjustMessages = $state<AdjustMessage[]>([]);
@@ -372,7 +376,7 @@
 			const res = await adjustPlan(goalId, content);
 			adjustMessages = [
 				...adjustMessages,
-				{ id: `a-${Date.now()}`, role: 'assistant', content: res.reply }
+				{ id: `a-${Date.now()}`, role: 'assistant', content: res.reply, proposal: res.proposal }
 			];
 			// The coach changed the plan/breaks — refresh so new milestones/dates/breaks render now.
 			if (res.changed) {
@@ -428,6 +432,30 @@
 
 	function closeAdjust(): void {
 		adjustOpen = false;
+	}
+
+	type MilestoneChange = AdjustProposal['milestone_changes'][number];
+
+	/** Drop no-op milestone changes (same date before and after) from the card. */
+	function visibleMilestoneChanges(changes: MilestoneChange[]): MilestoneChange[] {
+		return changes.filter((c) => !(c.old_due !== null && c.old_due === c.new_due));
+	}
+
+	/** How to render one milestone change: a new/removed badge or a before→after move. */
+	function milestoneChangeKind(c: MilestoneChange): 'new' | 'removed' | 'moved' {
+		if (c.old_due === null) return 'new';
+		if (c.new_due === null) return 'removed';
+		return 'moved';
+	}
+
+	/** True when the proposal has anything worth drawing a card for. */
+	function hasProposalContent(p: AdjustProposal): boolean {
+		return (
+			p.summary.trim() !== '' ||
+			p.add_breaks.length > 0 ||
+			p.remove_breaks.length > 0 ||
+			visibleMilestoneChanges(p.milestone_changes).length > 0
+		);
 	}
 
 	async function submitPledge(e: SubmitEvent): Promise<void> {
@@ -886,7 +914,64 @@
 						{#if message.role === 'assistant'}
 							<div class="row assistant">
 								<span class="av"><Icon name="check" size={14} stroke={2.6} /></span>
-								<div class="bubble a-bubble">{message.content}</div>
+								<div class="a-col">
+									<div class="bubble a-bubble"><Markdown source={message.content} /></div>
+									{#if message.proposal && hasProposalContent(message.proposal)}
+										{@const prop = message.proposal}
+										<div class="proposal">
+											{#if prop.summary.trim() !== ''}
+												<p class="prop-summary">{prop.summary}</p>
+											{/if}
+											{#if prop.add_breaks.length > 0}
+												<div class="prop-group">
+													<span class="prop-label">Breaks to add</span>
+													<ul class="prop-list">
+														{#each prop.add_breaks as brk, i (i)}
+															<li>
+																🌴 <strong>{brk.label}</strong>
+																<span class="prop-dates"
+																	>{shortDate(brk.start_date)}–{shortDate(brk.end_date)}</span
+																>
+															</li>
+														{/each}
+													</ul>
+												</div>
+											{/if}
+											{#if prop.remove_breaks.length > 0}
+												<div class="prop-group">
+													<span class="prop-label">Breaks to remove</span>
+													<ul class="prop-list">
+														{#each prop.remove_breaks as label, i (i)}
+															<li class="prop-remove">✕ {label}</li>
+														{/each}
+													</ul>
+												</div>
+											{/if}
+											{#if visibleMilestoneChanges(prop.milestone_changes).length > 0}
+												<div class="prop-group">
+													<span class="prop-label">Milestone dates</span>
+													<ul class="prop-list">
+														{#each visibleMilestoneChanges(prop.milestone_changes) as c, i (i)}
+															<li>
+																<strong>{c.title}</strong>
+																{#if milestoneChangeKind(c) === 'moved'}
+																	<span class="prop-dates"
+																		>{shortDate(c.old_due)} → {shortDate(c.new_due)}</span
+																	>
+																{:else if milestoneChangeKind(c) === 'new'}
+																	<span class="prop-badge">new</span>
+																	<span class="prop-dates">{shortDate(c.new_due)}</span>
+																{:else}
+																	<span class="prop-badge prop-badge-remove">removed</span>
+																{/if}
+															</li>
+														{/each}
+													</ul>
+												</div>
+											{/if}
+										</div>
+									{/if}
+								</div>
 							</div>
 						{:else}
 							<div class="row user">
@@ -1580,6 +1665,83 @@
 		background: var(--teal);
 		color: #fff;
 		border-radius: 16px 16px 4px 16px;
+	}
+	.a-col {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		max-width: 82%;
+		min-width: 0;
+	}
+	.a-col .bubble {
+		max-width: 100%;
+	}
+
+	/* structured proposal preview, under a coach message */
+	.proposal {
+		background: var(--tag-bg);
+		border: 1px solid var(--line);
+		border-radius: 14px;
+		padding: 12px 14px;
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		font-size: 13px;
+	}
+	.prop-summary {
+		margin: 0;
+		font-weight: 600;
+		color: var(--ink);
+		line-height: 1.4;
+	}
+	.prop-group {
+		display: flex;
+		flex-direction: column;
+		gap: 5px;
+	}
+	.prop-label {
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		font-size: 10px;
+		font-weight: 700;
+		color: var(--muted);
+	}
+	.prop-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.prop-list li {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 6px;
+		line-height: 1.4;
+	}
+	.prop-list strong {
+		font-weight: 600;
+	}
+	.prop-dates {
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
+	}
+	.prop-remove {
+		color: var(--muted);
+	}
+	.prop-badge {
+		font-size: 11px;
+		font-weight: 700;
+		padding: 1px 7px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--lime) 45%, var(--card));
+		color: var(--ink);
+	}
+	.prop-badge-remove {
+		background: var(--track);
+		color: var(--muted);
 	}
 	.notice {
 		display: flex;
