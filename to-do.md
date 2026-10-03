@@ -25,7 +25,8 @@ Server + client code, CI, deploy. These can be built/feature-flagged **before** 
 - [ ] FCM HTTP v1 **send** in `notify::deliver()` + from the coach `post_now` path: mint an OAuth token from the service account (`gcp_auth`) and `POST fcm.googleapis.com/v1/projects/{id}/messages:send` via `reqwest`.
 - [ ] Send **data-only** messages (keep coach text off Google's wire; render locally).
 - [ ] **Stale-token hygiene**: on FCM `UNREGISTERED`/404, delete that `push_tokens` row.
-- [ ] Config plumbing: `AIBUDDY_FCM_PROJECT_ID` + `GOOGLE_APPLICATION_CREDENTIALS` (path to the service-account JSON); **feature-flagged off** when unset (push silently disabled, in-app still works).
+- [ ] Config plumbing: read `AIBUDDY_FCM_PROJECT_ID` (✅ already in prod .env = `ai-buddy-4063c`) + `GOOGLE_APPLICATION_CREDENTIALS`; **feature-flagged off** when unset (push silently disabled, in-app still works).
+- [ ] **Mount the credential into the container**: add a `./fcm-service-account.json:/secrets/fcm.json:ro` bind to `docker-compose.yml` and set `GOOGLE_APPLICATION_CREDENTIALS=/secrets/fcm.json` in `.env` (the key file is already on bigboy at `~/env/osmosis/buddy/fcm-service-account.json`).
 - [ ] Tests + clippy/fmt gate.
 
 ### Mobile (Tauri Android)
@@ -43,16 +44,18 @@ Server + client code, CI, deploy. These can be built/feature-flagged **before** 
 
 ---
 
-## 🔴 Needs you (Claude cannot — external accounts / credentials)
-Claude has no access to your Google account and cannot create these.
+## 🔴 Needs you — Firebase setup ✅ DONE (2026-10-03, via Chrome in your account)
+Done together in your logged-in `rafal.kuka94` session:
 
-- [ ] **Create a Firebase project** (free Spark tier, no billing card). Console → Add project.
-- [ ] **Add an Android app** in that project with package id **`dev.aibuddy.app`**.
-- [ ] **Download `google-services.json`** → hand it to me (I'll store it as a GH Actions secret; it's low-sensitivity but kept out of git).
-- [ ] **Generate a service-account key**: Firebase console → Project settings → Service accounts → *Generate new private key* → download the JSON. This is the **FCM send credential (full send authority — keep secret)**. Hand it to me to place on bigboy, or place it yourself at `~/env/osmosis/buddy/fcm-service-account.json` (chmod 600).
-- [ ] Tell me the **Firebase project id**.
-- [ ] Acknowledge: FCM message **metadata** transits Google (mitigated — we send data-only messages, text rendered on-device).
-- [ ] On your phone: install the new nightly APK and **grant notification permission** (Android 13+ asks at runtime).
+- [x] **Firebase project created**: `ai-buddy` (project id **`ai-buddy-4063c`**), free Spark plan, under rafal.kuka94. (Google Analytics / Gemini / Dev Programme all left OFF.)
+- [x] **Android app registered** with package id **`dev.aibuddy.app`** (nickname "AI Buddy").
+- [x] **`google-services.json`** downloaded → stored as GH Actions secret **`GOOGLE_SERVICES_JSON_B64`** (base64). Local copy wiped.
+- [x] **Service-account key** generated → scp'd to bigboy **`~/env/osmosis/buddy/fcm-service-account.json`** (chmod 600). Local copy shredded. Service account: `firebase-adminsdk-fbsvc@ai-buddy-4063c.iam.gserviceaccount.com`.
+- [x] **`AIBUDDY_FCM_PROJECT_ID=ai-buddy-4063c`** added to prod `.env`.
+
+### 🔴 Still needs you (later, after the APK build)
+- [ ] On your phone: install the new nightly APK (once the FCM client code + CI injection land) and **grant notification permission** (Android 13+ asks at runtime).
+- [ ] (FYI, no action) FCM message **metadata** transits Google — mitigated: we send data-only messages, text rendered on-device.
 
 ---
 
