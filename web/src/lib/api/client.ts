@@ -256,6 +256,11 @@ export interface Settings {
 	chat_model: string;
 	/** The models the backend allows; only these should be offered in the UI. */
 	allowed_models: ModelOption[];
+	/**
+	 * The user's country as an ISO-3166-1 alpha-2 code (e.g. "DE"), or null when
+	 * unset. Used for holiday-aware planning.
+	 */
+	country: string | null;
 }
 
 // --- Typed API helpers --------------------------------------------------------
@@ -691,18 +696,35 @@ export function getSettings(options?: RequestOptions): Promise<Settings> {
 }
 
 /**
- * PUT /api/settings — change the chat model. Returns the saved value.
+ * PUT /api/settings — change the chat model and country. Returns the saved
+ * values. `country` is an ISO-3166-1 alpha-2 code, or null to clear it.
  * The backend responds 400 (ApiError.status === 400) if `chatModel` is not one
  * of the allowed models.
  */
 export function updateSettings(
 	chatModel: string,
+	country: string | null,
 	options?: RequestOptions
-): Promise<{ chat_model: string }> {
-	return request<{ chat_model: string }>(
+): Promise<{ chat_model: string; country: string | null }> {
+	return request<{ chat_model: string; country: string | null }>(
 		'PUT',
 		'/api/settings',
-		{ chat_model: chatModel },
+		{ chat_model: chatModel, country },
 		options
 	);
+}
+
+/**
+ * GET /api/settings/suggested-country — an offline, IP-based best guess at the
+ * user's country as an ISO-3166-1 alpha-2 code. Returns null when the backend
+ * can't guess. Used to pre-fill (not auto-save) the country selector.
+ */
+export async function getSuggestedCountry(options?: RequestOptions): Promise<string | null> {
+	const result = await request<{ country: string | null }>(
+		'GET',
+		'/api/settings/suggested-country',
+		undefined,
+		options
+	);
+	return result.country;
 }

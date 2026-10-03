@@ -39,6 +39,14 @@ serde_json = "1.0"
 base64 = "0.22"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+# Public-holiday data, fully offline/bundled (all ~100 countries via the default
+# feature). API is chrono::NaiveDate-based, so `chrono` rides along for the glue
+# (NaiveDate only — no clock/libc). Powers holiday-aware milestone scheduling.
+holidays = "0.1"
+chrono = { version = "0.4", default-features = false }
+# Offline IP->country lookup (reads a bundled DB-IP/GeoLite2 .mmdb) to PRE-FILL
+# the user's country setting. Optional at runtime: no DB => no pre-fill.
+maxminddb = "0.24"
 uuid = { version = "1.24", features = ["v4"] }
 rand = "0.10"
 thiserror = "2.0"

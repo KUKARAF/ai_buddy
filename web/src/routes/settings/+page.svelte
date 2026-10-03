@@ -1,8 +1,95 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
-	import { getSettings, updateSettings, ApiError, type Settings } from '$lib/api/client';
+	import {
+		getSettings,
+		updateSettings,
+		getSuggestedCountry,
+		ApiError,
+		type Settings
+	} from '$lib/api/client';
 	import { startLogin } from '$lib/app/login';
+
+	// ISO-3166-1 alpha-2 codes with human-readable names, offered in the country
+	// selector. A reasonably complete list; enough for holiday-aware planning.
+	const COUNTRIES: ReadonlyArray<{ code: string; name: string }> = [
+		{ code: 'AR', name: 'Argentina' },
+		{ code: 'AT', name: 'Austria' },
+		{ code: 'AU', name: 'Australia' },
+		{ code: 'BE', name: 'Belgium' },
+		{ code: 'BG', name: 'Bulgaria' },
+		{ code: 'BR', name: 'Brazil' },
+		{ code: 'CA', name: 'Canada' },
+		{ code: 'CH', name: 'Switzerland' },
+		{ code: 'CL', name: 'Chile' },
+		{ code: 'CN', name: 'China' },
+		{ code: 'CO', name: 'Colombia' },
+		{ code: 'CZ', name: 'Czechia' },
+		{ code: 'DE', name: 'Germany' },
+		{ code: 'DK', name: 'Denmark' },
+		{ code: 'EE', name: 'Estonia' },
+		{ code: 'EG', name: 'Egypt' },
+		{ code: 'ES', name: 'Spain' },
+		{ code: 'FI', name: 'Finland' },
+		{ code: 'FR', name: 'France' },
+		{ code: 'GB', name: 'United Kingdom' },
+		{ code: 'GR', name: 'Greece' },
+		{ code: 'HK', name: 'Hong Kong' },
+		{ code: 'HR', name: 'Croatia' },
+		{ code: 'HU', name: 'Hungary' },
+		{ code: 'ID', name: 'Indonesia' },
+		{ code: 'IE', name: 'Ireland' },
+		{ code: 'IL', name: 'Israel' },
+		{ code: 'IN', name: 'India' },
+		{ code: 'IS', name: 'Iceland' },
+		{ code: 'IT', name: 'Italy' },
+		{ code: 'JP', name: 'Japan' },
+		{ code: 'KR', name: 'South Korea' },
+		{ code: 'LT', name: 'Lithuania' },
+		{ code: 'LU', name: 'Luxembourg' },
+		{ code: 'LV', name: 'Latvia' },
+		{ code: 'MA', name: 'Morocco' },
+		{ code: 'MX', name: 'Mexico' },
+		{ code: 'MY', name: 'Malaysia' },
+		{ code: 'NG', name: 'Nigeria' },
+		{ code: 'NL', name: 'Netherlands' },
+		{ code: 'NO', name: 'Norway' },
+		{ code: 'NZ', name: 'New Zealand' },
+		{ code: 'PE', name: 'Peru' },
+		{ code: 'PH', name: 'Philippines' },
+		{ code: 'PL', name: 'Poland' },
+		{ code: 'PT', name: 'Portugal' },
+		{ code: 'RO', name: 'Romania' },
+		{ code: 'RS', name: 'Serbia' },
+		{ code: 'RU', name: 'Russia' },
+		{ code: 'SA', name: 'Saudi Arabia' },
+		{ code: 'SE', name: 'Sweden' },
+		{ code: 'SG', name: 'Singapore' },
+		{ code: 'SI', name: 'Slovenia' },
+		{ code: 'SK', name: 'Slovakia' },
+		{ code: 'TH', name: 'Thailand' },
+		{ code: 'TR', name: 'Türkiye' },
+		{ code: 'TW', name: 'Taiwan' },
+		{ code: 'UA', name: 'Ukraine' },
+		{ code: 'US', name: 'United States' },
+		{ code: 'VN', name: 'Vietnam' },
+		{ code: 'ZA', name: 'South Africa' }
+	];
+
+	// Fast membership test for a code we might pre-select (suggestion / locale).
+	const COUNTRY_CODES: Record<string, true> = {};
+	for (const c of COUNTRIES) COUNTRY_CODES[c.code] = true;
+
+	/** Best-effort country code from the browser locale, e.g. "de-DE" -> "DE". */
+	function countryFromLocale(): string | null {
+		if (typeof navigator === 'undefined') return null;
+		const locale = navigator.language;
+		if (!locale) return null;
+		const parts = locale.split('-');
+		if (parts.length < 2) return null;
+		const region = parts[parts.length - 1].toUpperCase();
+		return COUNTRY_CODES[region] ? region : null;
+	}
 
 	let settings = $state<Settings | null>(null);
 	let loading = $state(true);
@@ -10,6 +97,7 @@
 	let guest = $state(false);
 
 	let selected = $state('');
+	let selectedCountry = $state('');
 	let saving = $state(false);
 	let saved = $state(false);
 	let saveError = $state<string | null>(null);
@@ -21,6 +109,25 @@
 		try {
 			settings = await getSettings();
 			selected = settings.chat_model;
+			if (settings.country) {
+				// Already chosen — honour it (even if not in our list, keep it as-is).
+				selectedCountry = settings.country;
+			} else {
+				// Not set: pre-fill a best guess, but don't auto-save — let the user
+				// confirm by saving. Try the backend's IP guess first, then the locale.
+				let guess: string | null = null;
+				try {
+					guess = await getSuggestedCountry();
+				} catch {
+					guess = null;
+				}
+				if (guess && COUNTRY_CODES[guess]) {
+					selectedCountry = guess;
+				} else {
+					const fromLocale = countryFromLocale();
+					if (fromLocale) selectedCountry = fromLocale;
+				}
+			}
 		} catch (err) {
 			if (err instanceof ApiError && err.status === 401) {
 				guest = true;
@@ -32,23 +139,31 @@
 		}
 	});
 
-	async function onChange(next: string) {
-		if (next === selected || saving) return;
-		const previous = selected;
-		selected = next;
+	// Persist both the chat model and the country together (the backend expects
+	// both fields on every save). `nextModel`/`nextCountry` are the desired values.
+	async function save(nextModel: string, nextCountry: string) {
+		const prevModel = selected;
+		const prevCountry = selectedCountry;
+		selected = nextModel;
+		selectedCountry = nextCountry;
 		saving = true;
 		saved = false;
 		saveError = null;
 		if (savedTimer) clearTimeout(savedTimer);
 
 		try {
-			const result = await updateSettings(next);
+			const result = await updateSettings(nextModel, nextCountry === '' ? null : nextCountry);
 			selected = result.chat_model;
-			if (settings) settings.chat_model = result.chat_model;
+			selectedCountry = result.country ?? '';
+			if (settings) {
+				settings.chat_model = result.chat_model;
+				settings.country = result.country;
+			}
 			saved = true;
 			savedTimer = setTimeout(() => (saved = false), 2200);
 		} catch (err) {
-			selected = previous; // revert the pending choice
+			selected = prevModel; // revert the pending choice
+			selectedCountry = prevCountry;
 			saveError =
 				err instanceof ApiError
 					? err.status === 400
@@ -58,6 +173,16 @@
 		} finally {
 			saving = false;
 		}
+	}
+
+	async function onChange(next: string) {
+		if (next === selected || saving) return;
+		await save(next, selectedCountry);
+	}
+
+	async function onCountryChange(next: string) {
+		if (next === selectedCountry || saving) return;
+		await save(selected, next);
 	}
 </script>
 
@@ -121,6 +246,43 @@
 				<p class="muted">No models are available to choose right now.</p>
 			{/if}
 		</section>
+
+		<section class="card country-card">
+			<div class="section-head">
+				<h2>Country</h2>
+				<p class="muted">
+					Used so your plan avoids public holidays and the year-end period in your country.
+				</p>
+			</div>
+
+			{#if loading}
+				<p class="muted">Loading…</p>
+			{:else if !loadError}
+				<label class="sr-only" for="country">Country</label>
+				<select
+					id="country"
+					class="country-select"
+					disabled={saving}
+					value={selectedCountry}
+					onchange={(e) => void onCountryChange(e.currentTarget.value)}
+				>
+					<option value="">— Select country —</option>
+					{#each COUNTRIES as option (option.code)}
+						<option value={option.code}>{option.name}</option>
+					{/each}
+				</select>
+
+				<div class="status" aria-live="polite">
+					{#if saving}
+						<span class="muted small">Saving…</span>
+					{:else if saveError}
+						<span class="error small">{saveError}</span>
+					{:else if saved}
+						<span class="ok small"><Icon name="check" size={14} stroke={2.6} /> Saved</span>
+					{/if}
+				</div>
+			{/if}
+		</section>
 	{/if}
 </div>
 
@@ -138,11 +300,29 @@
 		margin: 6px 0 0;
 		font-size: 15px;
 	}
-	.model-card {
+	.model-card,
+	.country-card {
 		padding: 22px;
 		display: flex;
 		flex-direction: column;
 		gap: 16px;
+	}
+	.country-select {
+		border: 1px solid var(--line);
+		border-radius: 12px;
+		padding: 12px 14px;
+		font-size: 15px;
+		background: var(--bg);
+		color: inherit;
+		width: 100%;
+		cursor: pointer;
+	}
+	.country-select:hover {
+		border-color: var(--muted);
+	}
+	.country-select:disabled {
+		cursor: default;
+		opacity: 0.7;
 	}
 	.section-head h2 {
 		font-size: 18px;

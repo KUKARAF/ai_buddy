@@ -239,6 +239,7 @@ async fn refine_plan(
     state: &AppState,
     model: &str,
     today: &str,
+    user_id: &str,
     original: crate::goals::NewGoalWithPlan,
 ) -> (crate::goals::NewGoalWithPlan, i64) {
     let draft_json = match serde_json::to_string(&original) {
@@ -252,7 +253,16 @@ async fn refine_plan(
         .deadline
         .clone()
         .unwrap_or_else(|| "the deadline".to_string());
-    let user_prompt = critique_prompt(today, &deadline, &draft_json);
+    let mut user_prompt = critique_prompt(today, &deadline, &draft_json);
+    user_prompt.push_str(
+        &crate::goals::holiday_prompt_suffix(
+            &state.db,
+            user_id,
+            today,
+            original.deadline.as_deref(),
+        )
+        .await,
+    );
 
     match state
         .llm
@@ -742,7 +752,8 @@ async fn agent_turn(
                     Ok(draft) => {
                         let draft = sanitize_new_goal(draft);
                         // P5: one bounded critique/refinement pass before persisting.
-                        let (draft, refine_cost) = refine_plan(&state, &model, &today, draft).await;
+                        let (draft, refine_cost) =
+                            refine_plan(&state, &model, &today, &user_id, draft).await;
                         total_cost = total_cost.saturating_add(refine_cost);
                         match crate::goals::create_goal_with_milestones(&state, &user_id, draft)
                             .await

@@ -608,6 +608,30 @@ fn roadmap_user_prompt(goal: &GoalView) -> String {
     out
 }
 
+/// Best-effort "reduced-availability" prompt suffix (public holidays for the
+/// user's country + the Dec 24–Jan 1 blackout) over `[today, deadline]`, so the
+/// planner steers milestone due dates clear of them. Returns `""` when there is
+/// nothing to add (no deadline). It never fails the request: an error resolving
+/// the country degrades to `None` (which still yields the year-end blackout), and
+/// an empty block degrades to `""`. See [`crate::holidays`].
+pub(crate) async fn holiday_prompt_suffix(
+    pool: &SqlitePool,
+    user_id: &str,
+    today: &str,
+    deadline: Option<&str>,
+) -> String {
+    let deadline = match deadline.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d,
+        None => return String::new(),
+    };
+    let country = crate::settings::user_country(pool, user_id)
+        .await
+        .unwrap_or(None);
+    crate::holidays::prompt_block_for(country.as_deref(), today, deadline)
+        .map(|block| format!("\n\n{block}"))
+        .unwrap_or_default()
+}
+
 /// Persist a freshly generated roadmap: replaces any existing roadmap for the
 /// goal, inserts steps (`ord` = index), seeds reminders for dated steps, and
 /// best-effort embeds each step. Returns the roadmap id.
@@ -1013,7 +1037,14 @@ async fn generate_roadmap(
     // Resolve the user's chosen chat model (falls back to the config default).
     let model = crate::settings::user_chat_model(&state.db, &state.config, &user_id).await?;
 
-    let user_prompt = roadmap_user_prompt(&goal);
+    let today = now_rfc3339()?
+        .get(..10)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let mut user_prompt = roadmap_user_prompt(&goal);
+    user_prompt.push_str(
+        &holiday_prompt_suffix(&state.db, &user_id, &today, goal.deadline.as_deref()).await,
+    );
     let (draft, cost_cents) = state
         .llm
         .chat_json::<RoadmapDraft>(&model, ROADMAP_SYSTEM_PROMPT, &user_prompt)
@@ -1395,7 +1426,10 @@ async fn adjust_plan(
         .get(..10)
         .map(str::to_string)
         .unwrap_or_default();
-    let system = adjust_system_prompt(&today, &goal, &roadmap.steps, &roadmap.breaks);
+    let mut system = adjust_system_prompt(&today, &goal, &roadmap.steps, &roadmap.breaks);
+    system.push_str(
+        &holiday_prompt_suffix(&state.db, &user_id, &today, goal.deadline.as_deref()).await,
+    );
 
     // Build the OpenAI messages array: system prompt + prior history (which
     // already includes the message just inserted).

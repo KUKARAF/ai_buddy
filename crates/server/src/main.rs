@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod error;
 mod goals;
+mod holidays;
 mod llm;
 mod mcp;
 mod notify;

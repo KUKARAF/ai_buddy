@@ -62,6 +62,12 @@ pub struct Config {
     // --- MCP ---
     pub mcp_resource_uri: String,
     pub mcp_audience: String,
+
+    // --- GeoIP ---
+    /// Path to an offline MaxMind-DB-format IP->country database (DB-IP
+    /// IP-to-Country Lite or GeoLite2 Country `.mmdb`). `None` (unset/empty)
+    /// disables the optional country pre-fill. The client IP is never persisted.
+    pub geoip_db_path: Option<String>,
 }
 
 /// User id used for every request when [`Config::dev_mode`] is enabled.
@@ -192,6 +198,10 @@ impl Config {
 
             mcp_resource_uri,
             mcp_audience,
+
+            geoip_db_path: std::env::var("AIBUDDY_GEOIP_DB")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 
