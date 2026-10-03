@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onMount, onDestroy, tick } from 'svelte';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import { goto } from '$app/navigation';
@@ -7,6 +7,7 @@
 	import { app } from '$lib/appState.svelte';
 	import { shortDate, relativeDate, euros } from '$lib/format';
 	import { goalLook } from '$lib/goalView';
+	import { buildIcs, downloadIcs, icsFilename, type IcsEvent } from '$lib/ics';
 	import {
 		getGoal,
 		getRoadmap,
@@ -15,6 +16,8 @@
 		patchStep,
 		patchGoal,
 		createGoalCheckIn,
+		uploadCheckInPhoto,
+		fetchCheckInPhoto,
 		adjustPlan,
 		createPledge,
 		confirmPledge,
@@ -53,9 +56,14 @@
 	let note = $state('');
 	let checkinSubmitting = $state(false);
 
-	// Coach's post-check-in "want me to adjust your plan?" offer. Only shown when
-	// the backend actually offers it (suggestion.adjust === true).
-	let offer = $state<{ message: string; note: string } | null>(null);
+	// Photo attachment for the composer + per-check-in thumbnail object URLs.
+	let photoInput = $state<HTMLInputElement | null>(null);
+	let photoFile = $state<File | null>(null);
+	let photoError = $state<string | null>(null);
+	let photoUrls = $state<Record<string, string>>({});
+	const photoLoading: Record<string, true> = {};
+	// Full-size photo viewer (object URL shared with the thumbnail — don't revoke here).
+	let lightbox = $state<string | null>(null);
 
 	// "Adjust my plan" mini-chat (agentic, non-streaming coach turn).
 	interface AdjustMessage {
@@ -70,6 +78,7 @@
 	let adjustError = $state<string | null>(null);
 	let adjustNeedsTopup = $state(false);
 	let adjustUnavailable = $state(false);
+	let adjustChanged = $state(false);
 	let adjustThread = $state<HTMLElement | null>(null);
 
 	// pledge form
@@ -175,24 +184,175 @@
 		const text = note.trim();
 		if (text === '' || checkinSubmitting) return;
 		checkinSubmitting = true;
+		photoError = null;
+		let created;
 		try {
-			const ci = await createGoalCheckIn(goalId, { note: text });
-			checkIns = [ci, ...checkIns];
+			created = await createGoalCheckIn(goalId, { note: text });
+			checkIns = [created, ...checkIns];
 			note = '';
-			composerOpen = false;
 			void app.refreshStreak();
-			// Only surface the coach's offer when it genuinely wants to adjust — never fabricate one.
-			if (ci.suggestion?.adjust) {
-				offer = {
-					message: ci.suggestion.message ?? 'Want me to adjust your plan?',
-					note: text
-				};
-			}
 		} catch {
-			/* ignore; keep the text so the user can retry */
-		} finally {
+			// Keep the text (and the chosen photo) so the user can retry.
 			checkinSubmitting = false;
+			return;
 		}
+		// Photo is best-effort: the check-in already succeeded above.
+		const file = photoFile;
+		photoFile = null;
+		if (file) await attachPhoto(created.id, file);
+		composerOpen = false;
+		checkinSubmitting = false;
+		// When the coach wants to adjust, don't show a passive card: open the
+		// mini-chat and immediately send the note so it PROPOSES concrete changes.
+		if (created.suggestion?.adjust) {
+			void openAdjustFromCheckIn(text);
+		}
+	}
+
+	// --- Photos ----------------------------------------------------------------
+
+	function onPhotoPick(e: Event): void {
+		const input = e.currentTarget as HTMLInputElement;
+		photoFile = input.files?.[0] ?? null;
+		photoError = null;
+		// Clear so re-picking the same file still fires change.
+		input.value = '';
+	}
+
+	function canvasToBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+		return new Promise((resolve, reject) => {
+			canvas.toBlob(
+				(b) => (b ? resolve(b) : reject(new Error('encode failed'))),
+				'image/jpeg',
+				quality
+			);
+		});
+	}
+
+	// Downscale client-side (max ~1600px, JPEG ~0.8) so the upload fits the
+	// backend's 1 MiB body limit; step quality down if it's still too big.
+	async function downscaleImage(file: File): Promise<Blob> {
+		const MAX_DIM = 1600;
+		const TARGET_BYTES = 900 * 1024;
+		const dataUrl = await new Promise<string>((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(reader.result as string);
+			reader.onerror = () => reject(new Error('read failed'));
+			reader.readAsDataURL(file);
+		});
+		const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+			const el = new Image();
+			el.onload = () => resolve(el);
+			el.onerror = () => reject(new Error('decode failed'));
+			el.src = dataUrl;
+		});
+		let width = img.naturalWidth || img.width;
+		let height = img.naturalHeight || img.height;
+		if (width > MAX_DIM || height > MAX_DIM) {
+			const scale = MAX_DIM / Math.max(width, height);
+			width = Math.round(width * scale);
+			height = Math.round(height * scale);
+		}
+		const canvas = document.createElement('canvas');
+		canvas.width = width;
+		canvas.height = height;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) throw new Error('no canvas context');
+		ctx.drawImage(img, 0, 0, width, height);
+		let quality = 0.8;
+		let blob = await canvasToBlob(canvas, quality);
+		while (blob.size > TARGET_BYTES && quality > 0.4) {
+			quality -= 0.15;
+			blob = await canvasToBlob(canvas, quality);
+		}
+		return blob;
+	}
+
+	async function attachPhoto(checkInId: string, file: File): Promise<void> {
+		try {
+			const blob = await downscaleImage(file);
+			await uploadCheckInPhoto(checkInId, blob);
+			checkIns = checkIns.map((c) => (c.id === checkInId ? { ...c, has_photo: true } : c));
+			void loadPhoto(checkInId);
+		} catch {
+			// The check-in itself saved — only the photo failed.
+			photoError = 'Your check-in saved, but the photo could not be uploaded.';
+		}
+	}
+
+	// Fetch a check-in's photo (authenticated) and keep it as an object URL. Never
+	// shows a broken image: on any failure we simply don't add a URL.
+	async function loadPhoto(id: string): Promise<void> {
+		if (photoUrls[id] || photoLoading[id]) return;
+		photoLoading[id] = true;
+		try {
+			const blob = await fetchCheckInPhoto(id);
+			if (blob) photoUrls = { ...photoUrls, [id]: URL.createObjectURL(blob) };
+		} catch {
+			/* skip — no thumbnail rather than a broken image */
+		} finally {
+			delete photoLoading[id];
+		}
+	}
+
+	// Load thumbnails for any check-in that has a photo as the list arrives/updates.
+	$effect(() => {
+		for (const ci of checkIns) {
+			if (ci.has_photo) void loadPhoto(ci.id);
+		}
+	});
+
+	onDestroy(() => {
+		for (const url of Object.values(photoUrls)) URL.revokeObjectURL(url);
+	});
+
+	// --- Add to calendar (.ics, pure client-side) ------------------------------
+
+	const hasCalendarItems = $derived(
+		(goal?.deadline ?? null) !== null || steps.some((s) => s.due_date)
+	);
+
+	function addStepToCalendar(step: RoadmapStep): void {
+		if (!step.due_date || !goal) return;
+		const ics = buildIcs([
+			{ uid: step.id, date: step.due_date, summary: step.title, description: goal.title }
+		]);
+		downloadIcs(icsFilename(step.title), ics);
+	}
+
+	function addFinishLineToCalendar(): void {
+		if (!goal?.deadline) return;
+		const ics = buildIcs([
+			{
+				uid: goal.id,
+				date: goal.deadline,
+				summary: `Finish line: ${goal.title}`,
+				description: goal.success_criterion ?? goal.title
+			}
+		]);
+		downloadIcs(icsFilename(`${goal.title}-finish-line`), ics);
+	}
+
+	function addWholePlanToCalendar(): void {
+		if (!goal) return;
+		const events: IcsEvent[] = steps
+			.filter((s) => s.due_date)
+			.map((s) => ({
+				uid: s.id,
+				date: s.due_date as string,
+				summary: s.title,
+				description: goal!.title
+			}));
+		if (goal.deadline) {
+			events.push({
+				uid: goal.id,
+				date: goal.deadline,
+				summary: `Finish line: ${goal.title}`,
+				description: goal.success_criterion ?? goal.title
+			});
+		}
+		if (events.length === 0) return;
+		downloadIcs(icsFilename(goal.title), buildIcs(events));
 	}
 
 	async function scrollAdjust(): Promise<void> {
@@ -216,6 +376,7 @@
 			];
 			// The coach changed the plan/breaks — refresh so new milestones/dates/breaks render now.
 			if (res.changed) {
+				adjustChanged = true;
 				void getRoadmap(goalId)
 					.then((r) => (roadmap = r))
 					.catch(() => {});
@@ -237,21 +398,24 @@
 		}
 	}
 
-	async function openAdjust(seed?: string): Promise<void> {
+	function openAdjust(): void {
 		adjustOpen = true;
 		adjustError = null;
 		adjustNeedsTopup = false;
 		adjustUnavailable = false;
-		// Seed the conversation once with the just-made check-in note.
-		if (adjustMessages.length === 0 && seed !== undefined && seed.trim() !== '') {
-			await sendAdjust(seed.trim());
-		}
 	}
 
-	function acceptOffer(): void {
-		const seed = offer?.note;
-		offer = null;
-		void openAdjust(seed);
+	// Entered from a check-in whose coach suggestion asked to adjust: open the
+	// panel on a fresh thread and immediately send the note so the coach proposes
+	// concrete changes the user can confirm with a reply (e.g. "yes").
+	async function openAdjustFromCheckIn(seed: string): Promise<void> {
+		adjustOpen = true;
+		adjustError = null;
+		adjustNeedsTopup = false;
+		adjustUnavailable = false;
+		adjustChanged = false;
+		adjustMessages = [];
+		await sendAdjust(seed.trim());
 	}
 
 	function submitAdjust(e: SubmitEvent): void {
@@ -425,6 +589,27 @@
 								<p class="muted small">We'll build your milestones when coaching is available.</p>
 							</div>
 						{:else}
+							{#if hasCalendarItems}
+								<div class="cal-bar">
+									<button
+										type="button"
+										class="btn btn-ghost cal-all"
+										onclick={addWholePlanToCalendar}
+									>
+										📅 Add whole plan to calendar
+									</button>
+									{#if goal.deadline}
+										<button
+											type="button"
+											class="btn btn-ghost cal-all"
+											onclick={addFinishLineToCalendar}
+										>
+											🏁 Add finish line
+										</button>
+									{/if}
+								</div>
+							{/if}
+
 							<ol class="timeline">
 								{#each timeline as item (item.kind === 'step' ? item.step.id : `brk-${item.brk.id}`)}
 									{#if item.kind === 'step'}
@@ -453,6 +638,15 @@
 													<span class="chip-status completed">Completed</span>
 												{:else if item.step.effort}
 													<span class="chip-status">{item.step.effort}</span>
+												{/if}
+												{#if item.step.due_date}
+													<button
+														type="button"
+														class="cal-btn"
+														onclick={() => addStepToCalendar(item.step)}
+													>
+														📅 Add to calendar
+													</button>
 												{/if}
 											</div>
 										</li>
@@ -508,7 +702,34 @@
 									rows="3"
 									bind:value={note}
 									placeholder="How did it go? Even a messy day counts."></textarea>
+								<input
+									type="file"
+									accept="image/*"
+									bind:this={photoInput}
+									onchange={onPhotoPick}
+									hidden
+								/>
 								<div class="composer-foot">
+									<div class="attach">
+										<button
+											type="button"
+											class="btn btn-ghost attach-btn"
+											onclick={() => photoInput?.click()}
+										>
+											📷 Add photo
+										</button>
+										{#if photoFile}
+											<span class="attach-name">
+												{photoFile.name}
+												<button
+													type="button"
+													class="attach-x"
+													aria-label="Remove photo"
+													onclick={() => (photoFile = null)}>×</button
+												>
+											</span>
+										{/if}
+									</div>
 									<button
 										type="submit"
 										class="btn"
@@ -517,24 +738,8 @@
 										{checkinSubmitting ? 'Saving…' : 'Save check-in'}
 									</button>
 								</div>
+								{#if photoError}<p class="error small photo-err">{photoError}</p>{/if}
 							</form>
-						{/if}
-
-						{#if offer}
-							<div class="card offer">
-								<span class="offer-av"><Icon name="check" size={14} stroke={2.6} /></span>
-								<div class="offer-body">
-									<p class="offer-msg">{offer.message}</p>
-									<div class="offer-actions">
-										<button class="btn btn-lime offer-yes" onclick={acceptOffer}>
-											<Icon name="sparkle" size={15} /> Adjust my plan
-										</button>
-										<button class="btn btn-ghost offer-no" onclick={() => (offer = null)}>
-											Not now
-										</button>
-									</div>
-								</div>
-							</div>
 						{/if}
 
 						{#if checkIns.length === 0}
@@ -547,8 +752,18 @@
 								{#each checkIns as ci (ci.id)}
 									<li class="card ci-item">
 										<span class="ci-dot"><Icon name="check" size={13} stroke={2.6} /></span>
-										<div>
+										<div class="ci-body">
 											<p class="ci-note">{ci.note ?? 'Checked in.'}</p>
+											{#if ci.has_photo && photoUrls[ci.id]}
+												<button
+													type="button"
+													class="ci-photo"
+													aria-label="View check-in photo"
+													onclick={() => (lightbox = photoUrls[ci.id])}
+												>
+													<img src={photoUrls[ci.id]} alt="Check-in snapshot" />
+												</button>
+											{/if}
 											<span class="muted small">{relativeDate(ci.created_at)}</span>
 										</div>
 									</li>
@@ -688,10 +903,21 @@
 					{/if}
 				</section>
 
+				{#if adjustChanged}
+					<div class="notice notice-done">
+						<Icon name="check" size={18} stroke={2.4} />
+						<span>Your plan's updated — the new dates and breaks are in.</span>
+					</div>
+				{:else if adjustMessages.length > 0 && adjustMessages[adjustMessages.length - 1]?.role === 'assistant' && !adjustSending}
+					<p class="confirm-hint muted small">
+						Reply <strong>"yes"</strong> to apply these changes — or tell your coach what to tweak.
+					</p>
+				{/if}
+
 				{#if adjustNeedsTopup}
 					<div class="notice">
 						<Icon name="wallet" size={18} />
-						<span>Your wallet's empty — add a little to keep talking with your coach.</span>
+						<span>Top up your wallet so the coach can adjust your plan.</span>
 						<a class="btn btn-lime" href={resolve('/wallet')}>Open wallet</a>
 					</div>
 				{/if}
@@ -719,6 +945,19 @@
 						<Icon name="send" size={18} />
 					</button>
 				</form>
+			</div>
+		{/if}
+
+		{#if lightbox}
+			<div
+				class="lightbox"
+				role="button"
+				tabindex="-1"
+				aria-label="Close photo"
+				onclick={() => (lightbox = null)}
+				onkeydown={(e) => e.key === 'Escape' && (lightbox = null)}
+			>
+				<img src={lightbox} alt="Check-in snapshot" />
 			</div>
 		{/if}
 	{/if}
@@ -944,8 +1183,44 @@
 	}
 	.composer-foot {
 		display: flex;
-		justify-content: flex-end;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+		flex-wrap: wrap;
 		margin-top: 10px;
+	}
+	.attach {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+		min-width: 0;
+	}
+	.attach-btn {
+		padding: 8px 12px;
+		font-size: 13px;
+	}
+	.attach-name {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		max-width: 180px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 12px;
+		color: var(--muted);
+	}
+	.attach-x {
+		border: none;
+		background: transparent;
+		color: var(--muted);
+		font-size: 16px;
+		line-height: 1;
+		padding: 0 2px;
+	}
+	.photo-err {
+		margin: 10px 0 0;
 	}
 	.ci-list {
 		list-style: none;
@@ -971,9 +1246,45 @@
 		justify-content: center;
 		flex: none;
 	}
+	.ci-body {
+		min-width: 0;
+	}
 	.ci-note {
 		margin: 0 0 2px;
 		font-size: 14px;
+	}
+	.ci-photo {
+		display: block;
+		padding: 0;
+		border: 1px solid var(--line);
+		border-radius: 10px;
+		overflow: hidden;
+		background: var(--tag-bg);
+		margin: 6px 0;
+		line-height: 0;
+	}
+	.ci-photo img {
+		display: block;
+		width: 160px;
+		max-width: 100%;
+		height: 120px;
+		object-fit: cover;
+	}
+	.lightbox {
+		position: fixed;
+		inset: 0;
+		z-index: 50;
+		background: rgba(20, 40, 45, 0.78);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 24px;
+	}
+	.lightbox img {
+		max-width: 100%;
+		max-height: 100%;
+		border-radius: 12px;
+		box-shadow: var(--shadow);
 	}
 	.empty-plan {
 		display: flex;
@@ -1142,42 +1453,32 @@
 		font-weight: 600;
 	}
 
-	/* post-check-in coach offer */
-	.offer {
-		display: flex;
-		gap: 12px;
-		padding: 14px;
-		margin-bottom: 14px;
-		background: color-mix(in srgb, var(--lime) 18%, var(--card));
-	}
-	.offer-av {
-		width: 28px;
-		height: 28px;
-		border-radius: 999px;
-		background: var(--lime);
-		color: var(--ink);
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		flex: none;
-	}
-	.offer-body {
-		flex: 1;
-		min-width: 0;
-	}
-	.offer-msg {
-		margin: 2px 0 12px;
-		font-size: 14px;
-	}
-	.offer-actions {
+	/* add-to-calendar affordances in the plan tab */
+	.cal-bar {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 8px;
+		margin: 0 0 18px;
 	}
-	.offer-yes,
-	.offer-no {
+	.cal-all {
 		padding: 8px 12px;
 		font-size: 13px;
+	}
+	.cal-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		background: transparent;
+		border: 1px solid var(--line);
+		border-radius: 999px;
+		padding: 4px 10px;
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--sky-ink);
+		margin-top: 2px;
+	}
+	.cal-btn:hover {
+		background: var(--tag-bg);
 	}
 
 	/* adjust mini-chat modal */
@@ -1293,6 +1594,13 @@
 	}
 	.notice .btn {
 		margin-left: auto;
+	}
+	.notice-done {
+		background: color-mix(in srgb, var(--lime) 35%, var(--card));
+	}
+	.confirm-hint {
+		margin: 0;
+		padding: 2px 2px 0;
 	}
 	.adjust-form {
 		display: flex;

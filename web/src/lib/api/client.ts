@@ -145,6 +145,8 @@ export interface CheckIn {
 	note: string | null;
 	mood: string | null;
 	created_at: string;
+	/** True when a photo is attached (fetch it from GET /api/check-ins/:id/photo). */
+	has_photo: boolean;
 }
 
 /** Streak summary (GET /api/streak). */
@@ -489,6 +491,85 @@ export function listGoalCheckIns(goalId: string, options?: RequestOptions): Prom
 		undefined,
 		options
 	);
+}
+
+/**
+ * POST /api/check-ins/:id/photo — attach a photo to a check-in.
+ *
+ * This is NOT a JSON endpoint: the body is the RAW image bytes and the
+ * `Content-Type` is the image's own mime. It bypasses the JSON {@link request}
+ * helper but keeps the same auth (session cookie + device-token bearer). The
+ * backend replies 204 No Content on success. Throws {@link ApiError} otherwise.
+ */
+export async function uploadCheckInPhoto(
+	checkInId: string,
+	image: Blob,
+	options: RequestOptions = {}
+): Promise<void> {
+	const url = `${API_BASE_URL}/api/check-ins/${encodeURIComponent(checkInId)}/photo`;
+	const deviceToken = getDeviceToken();
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			method: 'POST',
+			credentials: 'include',
+			headers: {
+				'Content-Type': image.type || 'application/octet-stream',
+				...(deviceToken !== null ? { Authorization: `Bearer ${deviceToken}` } : {}),
+				...options.headers
+			},
+			body: image,
+			signal: options.signal
+		});
+	} catch (cause) {
+		throw new ApiError(
+			`Network error while requesting POST ${url}`,
+			0,
+			cause instanceof Error ? cause.message : cause
+		);
+	}
+	if (!response.ok) {
+		throw new ApiError(`Request failed with status ${response.status}`, response.status);
+	}
+}
+
+/**
+ * GET /api/check-ins/:id/photo — fetch a check-in's photo as a Blob.
+ *
+ * Authenticated (cookie + device-token bearer), so an `<img src>` pointed
+ * straight at this path wouldn't carry the bearer in the app build. Callers
+ * fetch the bytes here and wrap them in an object URL instead. Returns `null`
+ * when there's no photo (404); throws {@link ApiError} on other failures.
+ */
+export async function fetchCheckInPhoto(
+	checkInId: string,
+	options: RequestOptions = {}
+): Promise<Blob | null> {
+	const url = `${API_BASE_URL}/api/check-ins/${encodeURIComponent(checkInId)}/photo`;
+	const deviceToken = getDeviceToken();
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			method: 'GET',
+			credentials: 'include',
+			headers: {
+				...(deviceToken !== null ? { Authorization: `Bearer ${deviceToken}` } : {}),
+				...options.headers
+			},
+			signal: options.signal
+		});
+	} catch (cause) {
+		throw new ApiError(
+			`Network error while requesting GET ${url}`,
+			0,
+			cause instanceof Error ? cause.message : cause
+		);
+	}
+	if (!response.ok) {
+		if (response.status === 404) return null;
+		throw new ApiError(`Request failed with status ${response.status}`, response.status);
+	}
+	return response.blob();
 }
 
 /** POST /api/check-ins — log a standalone (or goal-linked) check-in. */

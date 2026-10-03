@@ -17,7 +17,10 @@
 
 use std::collections::HashSet;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::WithRejection;
@@ -43,9 +46,11 @@ const MIN_CLASSIFY_NOTE_LEN: usize = 6;
 
 /// System prompt for the best-effort check-in note classifier. Asks for a strict
 /// JSON verdict on whether the plan/timeline should be revisited.
-const CLASSIFY_SYSTEM: &str = "You analyze a user's check-in note about a goal. Decide if it implies the plan/timeline should be revisited — e.g. they'll be unavailable for a period (travel, holidays like Christmas, vacation), they're falling behind or ahead, injured/sick, or circumstances changed. Respond ONLY as JSON: {\"adjust\": boolean, \"message\": string}. If adjust is true, message is a SHORT, warm one-sentence offer from the coach to update the plan (e.g. \"Sounds like you'll be away over Christmas — want me to add a break and shift your milestones?\"). If the note is just routine progress with no scheduling impact, return {\"adjust\": false, \"message\": null}. Keep message under 160 characters.";
+const CLASSIFY_SYSTEM: &str = "You analyze a user's check-in note about a goal and decide whether the coach should offer to revisit the plan/timeline/milestones. Return adjust=true in EITHER of these cases: (1) a DISRUPTION that affects availability — they'll be away/travelling, on vacation, off for a holiday (e.g. Christmas, New Year's, Easter), sick/injured, an exam or busy period, or they're falling behind or ahead; OR (2) an INSTRUCTION, REQUEST or PREFERENCE about how the schedule should look — e.g. \"take the holidays into account\", \"don't set deadlines on/around Christmas\", \"avoid scheduling during <period>\", \"move things earlier/later\", \"I have less/more time now\", \"spread it out more\", \"make it more intense\", any mention of a named holiday/vacation/exam period, or any explicit ask to change the plan, timeline, deadlines or milestones. Respond ONLY as JSON: {\"adjust\": boolean, \"message\": string}. If adjust is true, message is a SHORT, warm one-sentence offer from the coach to update the plan (e.g. \"Happy to keep the holidays clear — want me to add a break around Christmas and shift your milestones?\" or \"Got it — want me to spread the milestones out so they land outside that period?\"). Keep adjust=false for routine progress with no scheduling impact (\"did my ride\", \"felt good\", \"finished week 2\") and return {\"adjust\": false, \"message\": null}. Keep message under 160 characters.";
 
-/// One `check_ins` row as returned to clients.
+/// One `check_ins` row as returned to clients. `has_photo` is computed from the
+/// `photo_mime` column (`photo_mime IS NOT NULL`) rather than stored directly, so
+/// the raw bytes/mime never ride along in list responses.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 struct CheckIn {
     id: String,
@@ -53,6 +58,7 @@ struct CheckIn {
     note: Option<String>,
     mood: Option<String>,
     created_at: String,
+    has_photo: bool,
 }
 
 /// Coach "offer" attached to a check-in response: whether the plan/timeline
@@ -218,7 +224,8 @@ async fn verify_goal_owner(pool: &SqlitePool, user_id: &str, goal_id: &str) -> A
 /// Fetch one check-in by id (used to return the freshly-inserted row).
 async fn fetch_checkin(pool: &SqlitePool, id: &str) -> AppResult<Option<CheckIn>> {
     sqlx::query_as::<_, CheckIn>(
-        "SELECT id, goal_id, note, mood, created_at FROM check_ins WHERE id = ?",
+        "SELECT id, goal_id, note, mood, created_at, (photo_mime IS NOT NULL) AS has_photo \
+         FROM check_ins WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -261,8 +268,8 @@ fn normalize(s: Option<String>) -> Option<String> {
 /// List check-ins for a goal, newest first.
 async fn list_goal_checkins(pool: &SqlitePool, goal_id: &str) -> AppResult<Vec<CheckIn>> {
     sqlx::query_as::<_, CheckIn>(
-        "SELECT id, goal_id, note, mood, created_at FROM check_ins \
-         WHERE goal_id = ? ORDER BY created_at DESC, id DESC",
+        "SELECT id, goal_id, note, mood, created_at, (photo_mime IS NOT NULL) AS has_photo \
+         FROM check_ins WHERE goal_id = ? ORDER BY created_at DESC, id DESC",
     )
     .bind(goal_id)
     .fetch_all(pool)
@@ -400,8 +407,8 @@ async fn list_checkins(
     RequireAuth(user_id): RequireAuth,
 ) -> AppResult<Json<Vec<CheckIn>>> {
     let rows = sqlx::query_as::<_, CheckIn>(
-        "SELECT id, goal_id, note, mood, created_at FROM check_ins \
-         WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        "SELECT id, goal_id, note, mood, created_at, (photo_mime IS NOT NULL) AS has_photo \
+         FROM check_ins WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
     )
     .bind(&user_id)
     .bind(LIST_LIMIT)
@@ -440,6 +447,136 @@ async fn get_streak(
     }))
 }
 
+// --- Photos -------------------------------------------------------------------
+
+/// Directory where check-in photos are stored, derived from the SQLite DB's
+/// parent directory (e.g. `/data/db/ai_buddy.db` → `/data/db/checkin_photos`).
+/// Each photo is written to `<dir>/<check_in_id>` (the mime lives in the DB).
+fn photo_dir(config: &Config) -> std::path::PathBuf {
+    let parent = match std::path::Path::new(&config.sqlite_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    parent.join("checkin_photos")
+}
+
+/// Verify the `check_ins` row exists and belongs to `user_id`; otherwise
+/// `NotFound` (a missing row and another user's row are indistinguishable).
+async fn verify_checkin_owner(
+    pool: &SqlitePool,
+    user_id: &str,
+    check_in_id: &str,
+) -> AppResult<()> {
+    let owner: Option<(String,)> = sqlx::query_as("SELECT user_id FROM check_ins WHERE id = ?")
+        .bind(check_in_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    match owner {
+        Some((o,)) if o == user_id => Ok(()),
+        _ => Err(AppError::NotFound),
+    }
+}
+
+/// Validate and persist a check-in photo: requires an `image/*` mime and
+/// non-empty bytes, verifies ownership, writes the bytes to `<dir>/<id>`
+/// (creating the dir on first use), and records the mime on the row. Shared by
+/// the upload handler and the tests.
+async fn store_checkin_photo(
+    pool: &SqlitePool,
+    config: &Config,
+    user_id: &str,
+    check_in_id: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> AppResult<()> {
+    // Normalize the mime (drop any `; charset=...` params) and require an image.
+    let mime = mime.split(';').next().unwrap_or("").trim();
+    if !mime.starts_with("image/") {
+        return Err(AppError::BadRequest(
+            "Content-Type must be an image/* type".to_string(),
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(AppError::BadRequest("empty image body".to_string()));
+    }
+
+    verify_checkin_owner(pool, user_id, check_in_id).await?;
+
+    let dir = photo_dir(config);
+    std::fs::create_dir_all(&dir).map_err(|e| AppError::Internal(e.into()))?;
+    std::fs::write(dir.join(check_in_id), bytes).map_err(|e| AppError::Internal(e.into()))?;
+
+    sqlx::query("UPDATE check_ins SET photo_mime = ? WHERE id = ?")
+        .bind(mime)
+        .bind(check_in_id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(())
+}
+
+/// Load a check-in's photo as `(mime, bytes)` for `user_id`. Returns `NotFound`
+/// when the check-in is missing, owned by someone else, or has no photo. Shared
+/// by the download handler and the tests.
+async fn load_checkin_photo(
+    pool: &SqlitePool,
+    config: &Config,
+    user_id: &str,
+    check_in_id: &str,
+) -> AppResult<(String, Vec<u8>)> {
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT user_id, photo_mime FROM check_ins WHERE id = ?")
+            .bind(check_in_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+    let mime = match row {
+        Some((owner, Some(mime))) if owner == user_id => mime,
+        _ => return Err(AppError::NotFound),
+    };
+    let bytes = std::fs::read(photo_dir(config).join(check_in_id))
+        .map_err(|e| AppError::Internal(e.into()))?;
+    Ok((mime, bytes))
+}
+
+/// `POST /api/check-ins/{id}/photo` — attach a raw image to a check-in.
+///
+/// Body is the raw image bytes; the `Content-Type` header gives the mime (must be
+/// `image/*`). The global 1 MiB body limit applies (the client downscales).
+async fn upload_checkin_photo(
+    State(state): State<AppState>,
+    RequireAuth(user_id): RequireAuth,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<StatusCode> {
+    let mime = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    store_checkin_photo(&state.db, &state.config, &user_id, &id, mime, &body).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/check-ins/{id}/photo` — the check-in's image bytes, with the stored
+/// mime and a private day-long cache.
+async fn get_checkin_photo(
+    State(state): State<AppState>,
+    RequireAuth(user_id): RequireAuth,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    let (mime, bytes) = load_checkin_photo(&state.db, &state.config, &user_id, &id).await?;
+    let headers = [
+        (axum::http::header::CONTENT_TYPE, mime),
+        (
+            axum::http::header::CACHE_CONTROL,
+            "private, max-age=86400".to_string(),
+        ),
+    ];
+    Ok((headers, Bytes::from(bytes)).into_response())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -447,6 +584,10 @@ pub fn router() -> Router<AppState> {
             post(create_goal_checkin).get(list_goal_checkins_handler),
         )
         .route("/api/check-ins", post(create_checkin).get(list_checkins))
+        .route(
+            "/api/check-ins/{id}/photo",
+            post(upload_checkin_photo).get(get_checkin_photo),
+        )
         .route("/api/streak", get(get_streak))
 }
 
@@ -700,5 +841,123 @@ mod tests {
             Some(true),
             "today (last in window) is checked"
         );
+    }
+
+    // ---- photo tests --------------------------------------------------------
+
+    /// A [`Config`] whose `sqlite_path` points inside `dir`, so [`photo_dir`]
+    /// resolves to a `checkin_photos/` subdir of the test's tempdir (never the
+    /// repo working directory).
+    fn test_config(dir: &tempfile::TempDir) -> Config {
+        let mut config = Config::from_env();
+        config.sqlite_path = dir
+            .path()
+            .join("test.db")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        config
+    }
+
+    #[tokio::test]
+    async fn posting_a_photo_sets_mime_and_get_returns_it() {
+        let (dir, pool) = test_pool().await;
+        insert_goal(&pool, "g1", "u1").await;
+        let created = insert_checkin(&pool, "u1", Some("g1"), Some("did it"), None)
+            .await
+            .expect("insert checkin");
+        assert!(!created.has_photo, "no photo on a fresh check-in");
+
+        let config = test_config(&dir);
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nfake-image-bytes";
+        store_checkin_photo(&pool, &config, "u1", &created.id, "image/png", png)
+            .await
+            .expect("store photo");
+
+        // The row now reports a photo.
+        let refetched = fetch_checkin(&pool, &created.id)
+            .await
+            .expect("fetch")
+            .expect("row exists");
+        assert!(refetched.has_photo, "has_photo true after upload");
+
+        // GET returns the same bytes with the stored mime.
+        let (mime, bytes) = load_checkin_photo(&pool, &config, "u1", &created.id)
+            .await
+            .expect("load photo");
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, png.to_vec());
+    }
+
+    #[tokio::test]
+    async fn posting_a_non_image_content_type_is_rejected() {
+        let (dir, pool) = test_pool().await;
+        let created = insert_checkin(&pool, "u1", None, Some("a note here"), None)
+            .await
+            .expect("insert checkin");
+        let config = test_config(&dir);
+
+        let err = store_checkin_photo(
+            &pool,
+            &config,
+            "u1",
+            &created.id,
+            "application/pdf",
+            b"%PDF",
+        )
+        .await
+        .expect_err("non-image must be rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        // An empty body is likewise rejected.
+        let empty = store_checkin_photo(&pool, &config, "u1", &created.id, "image/png", b"")
+            .await
+            .expect_err("empty body must be rejected");
+        assert!(matches!(empty, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn another_users_checkin_photo_is_not_found() {
+        let (dir, pool) = test_pool().await;
+        sqlx::query(
+            "INSERT INTO users (id, email, display_name, created_at) \
+             VALUES ('u2', NULL, NULL, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert u2");
+        let created = insert_checkin(&pool, "u2", None, Some("u2 note"), None)
+            .await
+            .expect("insert checkin");
+        let config = test_config(&dir);
+
+        // u1 cannot upload to u2's check-in...
+        let upload_err = store_checkin_photo(
+            &pool,
+            &config,
+            "u1",
+            &created.id,
+            "image/jpeg",
+            b"\xff\xd8\xff",
+        )
+        .await
+        .expect_err("upload to another user's check-in must be NotFound");
+        assert!(matches!(upload_err, AppError::NotFound));
+
+        // ...nor download it, even once u2 has attached one.
+        store_checkin_photo(
+            &pool,
+            &config,
+            "u2",
+            &created.id,
+            "image/jpeg",
+            b"\xff\xd8\xff",
+        )
+        .await
+        .expect("u2 can attach their own photo");
+        let download_err = load_checkin_photo(&pool, &config, "u1", &created.id)
+            .await
+            .expect_err("download of another user's photo must be NotFound");
+        assert!(matches!(download_err, AppError::NotFound));
     }
 }

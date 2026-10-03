@@ -1100,10 +1100,20 @@ reschedule or restructure the milestones so that no milestone due-date falls ins
 the plan still reaches the goal by its deadline. Do NOT invent breaks the user did not mention. \
 Call the tools (add_break, remove_break, update_milestones) ONLY AFTER the user has explicitly \
 confirmed your proposal in the conversation — never before, and never in the same reply as the \
-proposal. When you do call update_milestones, send the COMPLETE new ordered list of milestones \
-(it REPLACES all existing milestones), each with a realistic per-milestone effort and a YYYY-MM-DD \
-due_date between today and the deadline, avoiding every break period. After a tool succeeds, \
-briefly confirm what changed. Keep every reply short and encouraging.";
+proposal. When the user asks you to AVOID scheduling during a period or holiday (e.g. \"take the \
+holidays into account\", \"don't set any deadlines around Christmas\", \"keep December clear\"), \
+treat that period as off-limits: propose adding a break (add_break) covering it AND rescheduling \
+the milestones (update_milestones) so that NO milestone due_date falls inside ANY break — existing \
+or newly added — while the plan still reaches the goal by its deadline. You know the common NAMED \
+holidays even when the user gives no exact dates: resolve them to concrete YYYY-MM-DD dates using \
+the year implied by the plan's timeline (the goal deadline's year, or the next occurrence after \
+today) — e.g. Christmas ≈ Dec 24-26, New Year's ≈ Dec 31-Jan 1, Easter in spring, a named exam or \
+vacation period to its usual span — and state the exact dates you will use in your proposal so the \
+user can correct them. When you do call update_milestones, send the COMPLETE new ordered list of \
+milestones (it REPLACES all existing milestones), each with a realistic per-milestone effort and a \
+YYYY-MM-DD due_date between today and the deadline, and verify every due_date falls OUTSIDE every \
+break period before sending. After a tool succeeds, briefly confirm what changed. Keep every reply \
+short and encouraging, and keep this advice goal-agnostic.";
 
 /// Build the plan-adjustment system prompt with today's date and the goal's
 /// current plan (milestones) and breaks injected as grounding context.
