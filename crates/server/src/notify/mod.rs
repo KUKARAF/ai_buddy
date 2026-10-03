@@ -13,9 +13,9 @@
 
 use std::time::Duration as StdDuration;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use axum_extra::extract::WithRejection;
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,7 @@ struct ReminderRow {
     channel: String,
     payload: String,
     created_at: String,
+    read_at: Option<String>,
 }
 
 /// A notification as returned by `GET /api/notifications` (payload parsed to JSON).
@@ -67,6 +68,7 @@ struct NotificationDto {
     channel: String,
     payload: serde_json::Value,
     created_at: String,
+    read_at: Option<String>,
 }
 
 impl From<ReminderRow> for NotificationDto {
@@ -84,6 +86,7 @@ impl From<ReminderRow> for NotificationDto {
             channel: r.channel,
             payload,
             created_at: r.created_at,
+            read_at: r.read_at,
         }
     }
 }
@@ -96,7 +99,7 @@ fn now_rfc3339() -> anyhow::Result<String> {
 /// Reminders that are due at `now` and not yet delivered, oldest first.
 async fn poll_due(pool: &SqlitePool, now: &str) -> anyhow::Result<Vec<ReminderRow>> {
     let rows = sqlx::query_as::<_, ReminderRow>(
-        "SELECT id, user_id, goal_id, step_id, kind, scheduled_at, sent_at, channel, payload, created_at \
+        "SELECT id, user_id, goal_id, step_id, kind, scheduled_at, sent_at, channel, payload, created_at, read_at \
          FROM reminders \
          WHERE sent_at IS NULL AND scheduled_at <= ? \
          ORDER BY scheduled_at ASC \
@@ -201,6 +204,42 @@ impl Notifier {
         Ok(id)
     }
 
+    /// Post an in-app notification that is immediately delivered and unread.
+    /// Inserts scheduled_at=now, sent_at=now, read_at=NULL, channel="inapp".
+    pub async fn post_now(
+        &self,
+        user_id: &str,
+        goal_id: Option<&str>,
+        step_id: Option<&str>,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> AppResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_rfc3339()?;
+        let payload_s =
+            serde_json::to_string(&payload).map_err(|e| AppError::Internal(e.into()))?;
+
+        sqlx::query(
+            "INSERT INTO reminders \
+                 (id, user_id, goal_id, step_id, kind, scheduled_at, sent_at, channel, payload, created_at, read_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'inapp', ?, ?, NULL)",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(goal_id)
+        .bind(step_id)
+        .bind(kind)
+        .bind(&now)
+        .bind(&now)
+        .bind(&payload_s)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+        Ok(id)
+    }
+
     /// Spawn the background reminder/tip scheduler: a tokio loop that ticks every
     /// [`TICK_INTERVAL`], delivering due reminders. Resilient — a failed tick is
     /// logged and the loop continues; it never panics or exits.
@@ -229,7 +268,7 @@ async fn list_notifications(
     RequireAuth(user_id): RequireAuth,
 ) -> AppResult<Json<Vec<NotificationDto>>> {
     let rows = sqlx::query_as::<_, ReminderRow>(
-        "SELECT id, user_id, goal_id, step_id, kind, scheduled_at, sent_at, channel, payload, created_at \
+        "SELECT id, user_id, goal_id, step_id, kind, scheduled_at, sent_at, channel, payload, created_at, read_at \
          FROM reminders \
          WHERE user_id = ? \
          ORDER BY scheduled_at DESC, created_at DESC \
@@ -243,6 +282,42 @@ async fn list_notifications(
 
     let out = rows.into_iter().map(NotificationDto::from).collect();
     Ok(Json(out))
+}
+
+/// `PATCH /api/notifications/{id}/read` — mark one notification read (no-op if
+/// already read). Scoped to the caller via `user_id`.
+async fn mark_read(
+    State(state): State<AppState>,
+    RequireAuth(user_id): RequireAuth,
+    Path(id): Path<String>,
+) -> AppResult<StatusCode> {
+    let now = now_rfc3339()?;
+    sqlx::query(
+        "UPDATE reminders SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL",
+    )
+    .bind(&now)
+    .bind(&id)
+    .bind(&user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/notifications/read-all` — mark all the caller's unread
+/// notifications read.
+async fn mark_all_read(
+    State(state): State<AppState>,
+    RequireAuth(user_id): RequireAuth,
+) -> AppResult<StatusCode> {
+    let now = now_rfc3339()?;
+    sqlx::query("UPDATE reminders SET read_at = ? WHERE user_id = ? AND read_at IS NULL")
+        .bind(&now)
+        .bind(&user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/push-tokens` — register/refresh a push token for the caller.
@@ -284,6 +359,8 @@ async fn upsert_push_token(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/notifications", get(list_notifications))
+        .route("/api/notifications/{id}/read", patch(mark_read))
+        .route("/api/notifications/read-all", post(mark_all_read))
         .route("/api/push-tokens", post(upsert_push_token))
 }
 
@@ -302,12 +379,41 @@ mod tests {
             .unwrap();
         sqlx::query(
             "INSERT INTO users (id, email, display_name, created_at) \
-             VALUES ('u1', NULL, NULL, '2026-01-01T00:00:00Z')",
+             VALUES ('u1', NULL, NULL, '2026-01-01T00:00:00Z'), \
+                    ('u2', NULL, NULL, '2026-01-01T00:00:00Z')",
         )
         .execute(&pool)
         .await
         .unwrap();
         (dir, pool)
+    }
+
+    /// Run the same SELECT as `list_notifications` for one user and map to DTOs.
+    async fn list_for(pool: &SqlitePool, user_id: &str) -> Vec<NotificationDto> {
+        let rows = sqlx::query_as::<_, ReminderRow>(
+            "SELECT id, user_id, goal_id, step_id, kind, scheduled_at, sent_at, channel, payload, created_at, read_at \
+             FROM reminders \
+             WHERE user_id = ? \
+             ORDER BY scheduled_at DESC, created_at DESC \
+             LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(POLL_BATCH)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter().map(NotificationDto::from).collect()
+    }
+
+    /// Read one row's `read_at` directly.
+    async fn read_at_of(pool: &SqlitePool, id: &str) -> Option<String> {
+        let (read_at,): (Option<String>,) =
+            sqlx::query_as("SELECT read_at FROM reminders WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        read_at
     }
 
     #[tokio::test]
@@ -366,9 +472,10 @@ mod tests {
         let now = now_rfc3339().unwrap();
         let due = poll_due(&pool, &now).await.unwrap();
         assert_eq!(due.len(), 1, "the due reminder is found by the poll query");
-        assert_eq!(due[0].id, id);
+        let first = due.first().unwrap();
+        assert_eq!(first.id, id);
 
-        deliver(&pool, &due[0]).await.unwrap();
+        deliver(&pool, first).await.unwrap();
 
         let (sent_at,): (Option<String>,) =
             sqlx::query_as("SELECT sent_at FROM reminders WHERE id = ?")
@@ -405,5 +512,173 @@ mod tests {
         let now = now_rfc3339().unwrap();
         let due = poll_due(&pool, &now).await.unwrap();
         assert!(due.is_empty(), "a future reminder is not yet due");
+    }
+
+    #[tokio::test]
+    async fn post_now_inserts_delivered_unread_row() {
+        let (_dir, pool) = test_pool().await;
+        let notifier = Notifier::new(pool.clone());
+
+        let id = notifier
+            .post_now(
+                "u1",
+                Some("g1"),
+                None,
+                "coach",
+                serde_json::json!({ "text": "nice work" }),
+            )
+            .await
+            .unwrap();
+
+        // Delivered immediately: sent_at set, read_at NULL, channel inapp.
+        let (sent_at, channel): (Option<String>, String) =
+            sqlx::query_as("SELECT sent_at, channel FROM reminders WHERE id = ?")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            sent_at.is_some(),
+            "post_now delivers immediately (sent_at set)"
+        );
+        assert_eq!(channel, "inapp");
+        assert_eq!(
+            read_at_of(&pool, &id).await,
+            None,
+            "new notification is unread"
+        );
+
+        // The list query returns it with read_at = null.
+        let list = list_for(&pool, "u1").await;
+        let item = list.into_iter().find(|n| n.id == id).unwrap();
+        assert_eq!(item.read_at, None);
+        assert_eq!(item.sent_at, sent_at);
+        let json = serde_json::to_value(&item).unwrap();
+        assert!(
+            json.get("read_at").is_some(),
+            "DTO serializes a read_at field"
+        );
+        assert!(
+            json.get("read_at").unwrap().is_null(),
+            "read_at is null when unread"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_read_sets_read_at_and_is_idempotent() {
+        let (_dir, pool) = test_pool().await;
+        let notifier = Notifier::new(pool.clone());
+
+        let id = notifier
+            .post_now("u1", None, None, "coach", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let now = now_rfc3339().unwrap();
+        // Same statement as the PATCH handler.
+        sqlx::query(
+            "UPDATE reminders SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&id)
+        .bind("u1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first = read_at_of(&pool, &id).await;
+        assert_eq!(first.as_deref(), Some(now.as_str()), "read_at is stamped");
+
+        // Marking read again is a no-op: the `read_at IS NULL` guard means the
+        // already-set timestamp is not overwritten.
+        let later = "2999-12-31T23:59:59Z";
+        sqlx::query(
+            "UPDATE reminders SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL",
+        )
+        .bind(later)
+        .bind(&id)
+        .bind("u1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_at_of(&pool, &id).await,
+            first,
+            "re-marking an already-read notification does not change read_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_read_rejects_another_users_notification() {
+        let (_dir, pool) = test_pool().await;
+        let notifier = Notifier::new(pool.clone());
+
+        let id = notifier
+            .post_now("u1", None, None, "coach", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let now = now_rfc3339().unwrap();
+        // u2 attempts to mark u1's notification read.
+        sqlx::query(
+            "UPDATE reminders SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&id)
+        .bind("u2")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_at_of(&pool, &id).await,
+            None,
+            "another user cannot mark this notification read"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_all_clears_only_callers_unread() {
+        let (_dir, pool) = test_pool().await;
+        let notifier = Notifier::new(pool.clone());
+
+        let a = notifier
+            .post_now("u1", None, None, "coach", serde_json::json!({}))
+            .await
+            .unwrap();
+        let b = notifier
+            .post_now("u1", None, None, "coach", serde_json::json!({}))
+            .await
+            .unwrap();
+        let other = notifier
+            .post_now("u2", None, None, "coach", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let now = now_rfc3339().unwrap();
+        // Same statement as the read-all handler.
+        sqlx::query("UPDATE reminders SET read_at = ? WHERE user_id = ? AND read_at IS NULL")
+            .bind(&now)
+            .bind("u1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(read_at_of(&pool, &a).await.is_some(), "u1's first is read");
+        assert!(read_at_of(&pool, &b).await.is_some(), "u1's second is read");
+        assert_eq!(
+            read_at_of(&pool, &other).await,
+            None,
+            "another user's notification is untouched"
+        );
+
+        // u1 now has no unread rows.
+        let u1_unread = list_for(&pool, "u1")
+            .await
+            .into_iter()
+            .filter(|n| n.read_at.is_none())
+            .count();
+        assert_eq!(u1_unread, 0);
     }
 }

@@ -36,6 +36,8 @@ use crate::error::{AppError, AppResult};
 use crate::llm::LlmClient;
 use crate::state::AppState;
 
+mod coach_review;
+
 /// Upper bound on rows returned by `GET /api/check-ins`.
 const LIST_LIMIT: i64 = 100;
 
@@ -94,6 +96,11 @@ struct GoalCheckInResponse {
     /// the current milestone, gear/logistics/prep/other at the goal level. Empty
     /// normally.
     todos_added: Vec<crate::todos::TodoView>,
+    /// Warm coach review of this check-in's progress (best-effort, LLM-produced).
+    /// `None` when the note is trivial, the pass is skipped, or anything errors —
+    /// it never fails or blocks the check-in. When present it is also posted as an
+    /// in-app notification, gated to avoid spam.
+    coach: Option<coach_review::CoachReview>,
 }
 
 /// The model's verdict, parsed from the classifier's JSON output. Fields default
@@ -382,11 +389,28 @@ async fn create_goal_checkin(
     )
     .await;
 
+    // Best-effort coach review — runs LAST, after classification and todo
+    // processing, so it can acknowledge the todos this check-in ticked/added. It
+    // never fails or blocks the check-in: any error/skip yields `None`.
+    let coach = coach_review::coach_review(
+        &state.llm,
+        &state.db,
+        &state.config,
+        &state.notifier,
+        &user_id,
+        &goal_id,
+        note.as_deref(),
+        &todo_result.completed,
+        &todo_result.added,
+    )
+    .await;
+
     Ok(Json(GoalCheckInResponse {
         check_in,
         suggestion,
         todos_completed: todo_result.completed,
         todos_added: todo_result.added,
+        coach,
     }))
 }
 

@@ -233,10 +233,30 @@ export interface Roadmap {
 export interface Notification {
 	id: string;
 	goal_id: string | null;
+	/** The roadmap step this notification relates to, when any. */
+	step_id: string | null;
 	kind: string;
-	payload: unknown;
+	payload: Record<string, unknown>;
 	scheduled_at: string;
 	sent_at: string | null;
+	/** Delivery channel (e.g. "in_app", "push"). */
+	channel: string;
+	created_at: string;
+	/** When the caller marked this read, or null while still unread. */
+	read_at: string | null;
+}
+
+/**
+ * The coach's structured review of a check-in. Delivered both inline on the
+ * check-in response and as a `kind: "coach"` notification (in its `payload`).
+ */
+export interface CoachReview {
+	status: 'on_track' | 'ahead' | 'at_risk' | 'off_track';
+	headline: string;
+	message: string;
+	questions: string[];
+	suggestions: string[];
+	risks: string[];
 }
 
 /**
@@ -530,6 +550,12 @@ export interface GoalCheckInResponse extends CheckIn {
 	 * note surfaced). Can be training (milestone) or goal-level; empty when none.
 	 */
 	todos_added: Todo[];
+	/**
+	 * The coach's structured review of this check-in, when the coach weighed in
+	 * (null when there's no review — e.g. coaching unavailable). Additive: the
+	 * existing `suggestion.adjust` flow is unchanged.
+	 */
+	coach: CoachReview | null;
 }
 
 /** POST /api/goals/:id/check-ins — log a check-in against a goal. */
@@ -768,6 +794,16 @@ export function getRoadmap(goalId: string, options?: RequestOptions): Promise<Ro
 /** GET /api/notifications — in-app notifications (reminders, tips, check-ins). */
 export function listNotifications(options?: RequestOptions): Promise<Notification[]> {
 	return request<Notification[]>('GET', '/api/notifications', undefined, options);
+}
+
+/** PATCH /api/notifications/:id/read — mark one notification read (204). */
+export async function markNotificationRead(id: string, options?: RequestOptions): Promise<void> {
+	await request<void>('PATCH', `/api/notifications/${encodeURIComponent(id)}/read`, {}, options);
+}
+
+/** POST /api/notifications/read-all — mark all of the caller's notifications read (204). */
+export async function markAllNotificationsRead(options?: RequestOptions): Promise<void> {
+	await request<void>('POST', '/api/notifications/read-all', {}, options);
 }
 
 // --- Circles ------------------------------------------------------------------

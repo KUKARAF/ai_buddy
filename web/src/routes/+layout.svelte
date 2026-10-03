@@ -5,7 +5,9 @@
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import Icon from '$lib/components/Icon.svelte';
+	import NotificationBell from '$lib/components/NotificationBell.svelte';
 	import { app } from '$lib/appState.svelte';
+	import { notifications } from '$lib/notificationsState.svelte';
 	import { coach } from '$lib/coachState.svelte';
 	import { IS_APP } from '$lib/api/deviceToken';
 	import { startLogin } from '$lib/app/login';
@@ -28,6 +30,9 @@
 				unlistenDeepLink = await initDeepLinkAuth(() => app.reload());
 			}
 			await app.ensureLoaded();
+			// Hydrate the notifications bell once auth is known (client-side only;
+			// onMount never runs on the server). Guests resolve to an empty list.
+			if (!app.isGuest) void notifications.refresh();
 		})();
 
 		return () => unlistenDeepLink?.();
@@ -159,6 +164,7 @@
 			</div>
 			<div class="topbar-right">
 				<span class="private muted"><Icon name="lock" size={15} /> Your private space</span>
+				<NotificationBell />
 				<button class="btn newgoal" onclick={startCoach}>
 					<Icon name="plus" size={16} /> New goal
 				</button>

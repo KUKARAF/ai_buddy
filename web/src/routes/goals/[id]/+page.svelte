@@ -6,6 +6,7 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import Markdown from '$lib/components/Markdown.svelte';
 	import { app } from '$lib/appState.svelte';
+	import { notifications } from '$lib/notificationsState.svelte';
 	import { shortDate, relativeDate, euros } from '$lib/format';
 	import { goalLook } from '$lib/goalView';
 	import { buildIcs, downloadIcs, icsFilename, type IcsEvent } from '$lib/ics';
@@ -38,7 +39,8 @@
 		type Pledge,
 		type SimilarGoals,
 		type AdjustProposal,
-		type Todo
+		type Todo,
+		type CoachReview
 	} from '$lib/api/client';
 
 	const goalId = page.params.id ?? '';
@@ -74,6 +76,25 @@
 	// Brief confirmation after a check-in auto-ticks some TODOs.
 	let tickedConfirm = $state<string | null>(null);
 	let tickedTimer: ReturnType<typeof setTimeout> | null = null;
+
+	// The coach's inline review of the most recent check-in (additive: shown
+	// alongside, not instead of, the existing adjust flow + todo toasts).
+	let coachReview = $state<CoachReview | null>(null);
+
+	// Status -> { label, class } for the inline coach pill. Text label is always
+	// present so the state is never conveyed by color alone (a11y).
+	function coachStatusMeta(status: CoachReview['status']): { label: string; cls: string } {
+		switch (status) {
+			case 'ahead':
+				return { label: 'Ahead', cls: 'st-ahead' };
+			case 'on_track':
+				return { label: 'On track', cls: 'st-on_track' };
+			case 'at_risk':
+				return { label: 'At risk', cls: 'st-at_risk' };
+			case 'off_track':
+				return { label: 'Off track', cls: 'st-off_track' };
+		}
+	}
 
 	// Cycling emojis for the "Planning your journey" placeholder.
 	const PLANNING_EMOJIS = ['🗺️', '🧭', '🚴', '✨', '🎯'];
@@ -382,6 +403,11 @@
 				.then((t) => (goalTodos = t))
 				.catch(() => {});
 		}
+		// Show the coach's inline review, if any (additive — the adjust flow below
+		// and the todo toasts above are unchanged). Refresh the bell so the same
+		// review (delivered as a notification) updates the unread count.
+		coachReview = created.coach ?? null;
+		void notifications.refresh();
 		// Photo is best-effort: the check-in already succeeded above.
 		const file = photoFile;
 		photoFile = null;
@@ -1034,6 +1060,38 @@
 								</div>
 								{#if photoError}<p class="error small photo-err">{photoError}</p>{/if}
 							</form>
+						{/if}
+
+						{#if coachReview}
+							{@const meta = coachStatusMeta(coachReview.status)}
+							<section class="card coach-review" aria-label="Coach review">
+								<div class="cr-top">
+									<span class="cr-badge"><Icon name="sparkle" size={15} /></span>
+									<span class="st-pill {meta.cls}">{meta.label}</span>
+									<span class="cr-who muted small">Your coach</span>
+									<button
+										class="cr-close"
+										aria-label="Dismiss coach review"
+										onclick={() => (coachReview = null)}
+									>
+										<Icon name="x" size={16} />
+									</button>
+								</div>
+								{#if coachReview.headline}<p class="cr-headline">{coachReview.headline}</p>{/if}
+								{#if coachReview.message}<p class="cr-msg">{coachReview.message}</p>{/if}
+								{#if coachReview.questions.length > 0}
+									<p class="cr-sub">A question for you</p>
+									<ul class="cr-list">
+										{#each coachReview.questions as q, i (i)}<li>{q}</li>{/each}
+									</ul>
+								{/if}
+								{#if coachReview.suggestions.length > 0}
+									<p class="cr-sub">Try this</p>
+									<ul class="cr-list">
+										{#each coachReview.suggestions as s, i (i)}<li>{s}</li>{/each}
+									</ul>
+								{/if}
+							</section>
 						{/if}
 
 						{#if checkIns.length === 0}
@@ -1720,6 +1778,97 @@
 	}
 	.photo-err {
 		margin: 10px 0 0;
+	}
+
+	/* inline coach review card (shown after a check-in) */
+	.coach-review {
+		padding: 16px;
+		margin-bottom: 14px;
+		border-left: 4px solid var(--lime);
+	}
+	.cr-top {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+	.cr-badge {
+		width: 28px;
+		height: 28px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--lime) 35%, var(--card));
+		color: var(--ink);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: none;
+	}
+	.cr-who {
+		font-weight: 600;
+	}
+	.cr-close {
+		margin-left: auto;
+		background: transparent;
+		border: none;
+		color: var(--muted);
+		display: inline-flex;
+		padding: 4px;
+		border-radius: 8px;
+	}
+	.cr-close:hover {
+		color: var(--ink);
+		background: var(--tag-bg);
+	}
+	.cr-headline {
+		margin: 10px 0 2px;
+		font-size: 16px;
+		font-weight: 700;
+		line-height: 1.3;
+	}
+	.cr-msg {
+		margin: 2px 0 0;
+		font-size: 14px;
+		line-height: 1.5;
+	}
+	.cr-sub {
+		margin: 12px 0 2px;
+		font-size: 11px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--muted);
+	}
+	.cr-list {
+		margin: 0;
+		padding-left: 18px;
+		font-size: 14px;
+		line-height: 1.5;
+	}
+	.cr-list li {
+		margin: 2px 0;
+	}
+	.st-pill {
+		display: inline-block;
+		border-radius: 999px;
+		padding: 2px 10px;
+		font-size: 11px;
+		font-weight: 700;
+	}
+	.st-on_track {
+		background: color-mix(in srgb, var(--sage) 55%, var(--card));
+		color: var(--sage-ink);
+	}
+	.st-ahead {
+		background: color-mix(in srgb, var(--lime) 45%, var(--card));
+		color: var(--ink);
+	}
+	.st-at_risk {
+		background: #fbe7c4;
+		color: #9a6b19;
+	}
+	.st-off_track {
+		background: #f7d6d2;
+		color: #9f3a2e;
 	}
 	.ci-list {
 		list-style: none;

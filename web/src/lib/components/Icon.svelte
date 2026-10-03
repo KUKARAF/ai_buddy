@@ -100,6 +100,9 @@
 	{:else if name === 'pin'}
 		<path d="M12 21s6-5.3 6-10a6 6 0 0 0-12 0c0 4.7 6 10 6 10Z" />
 		<circle cx="12" cy="11" r="2.2" />
+	{:else if name === 'bell'}
+		<path d="M6 9a6 6 0 0 1 12 0c0 5 1.5 6 2 7H4c.5-1 2-2 2-7Z" />
+		<path d="M10 20a2 2 0 0 0 4 0" />
 	{:else if name === 'sprout'}
 		<path d="M12 20v-8" />
 		<path d="M12 12c0-3 2.2-5 5-5 0 3-2.2 5-5 5Z" />
